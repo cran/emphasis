@@ -1,0 +1,1873 @@
+// Part of the emphasis R package (MIT licence, see LICENSE). This file builds on
+// the earlier C++ implementation by Hanno Hildenbrandt (2020).
+
+//
+// C++-API for plug-in diversification model
+// Hanno Hildenbrandt 2020
+//
+
+#ifndef EMPHASIS_PLUGIN_HPP_INCLUDED
+#define EMPHASIS_PLUGIN_HPP_INCLUDED
+
+#include <vector>
+#include <stdexcept>
+#include <string>
+#include <functional>
+#include <atomic>
+#include <cstdint>
+#include <unordered_map>
+#include <mutex>
+#include <set>
+#include <algorithm>
+#include <memory>
+#include <cstring>
+#include "model_helpers.hpp"
+#include "ed_covariate.hpp"
+
+using namespace emphasis::detail;
+
+namespace emphasis {
+
+  using param_t = std::vector<double>;                  // unspecific parameters
+  using tree_t = std::vector<node_t>;                   // tree, sorted by note_t::brts
+
+  // The parameter layout.  The first eight slots are the {N, M, D} basis the
+  // package has always carried; the ED coefficients are appended, then the K
+  // coefficients, so that an 8-element vector is exactly "ED and K absent"
+  // and every index in the code that predates them still means what it did.
+  // model_bin has one flag per covariate, {use_N, use_M, use_D, use_ED,
+  // use_K}; a shorter model_bin is padded.
+  constexpr std::size_t n_covariates = 5;
+  constexpr std::size_t n_params     = 12;   // 2 intercepts + 2 * n_covariates
+  constexpr std::size_t slot_beta_ed  = 8;
+  constexpr std::size_t slot_gamma_ed = 9;
+  constexpr std::size_t slot_beta_k   = 10;
+  constexpr std::size_t slot_gamma_k  = 11;
+
+  // The ED and K coefficients of a parameter vector that may be shorter.
+  inline double beta_ed(const param_t& p)  { return p.size() > slot_beta_ed  ? p[slot_beta_ed]  : 0.0; }
+  inline double gamma_ed(const param_t& p) { return p.size() > slot_gamma_ed ? p[slot_gamma_ed] : 0.0; }
+  inline double beta_k(const param_t& p)   { return p.size() > slot_beta_k   ? p[slot_beta_k]   : 0.0; }
+  inline double gamma_k(const param_t& p)  { return p.size() > slot_gamma_k  ? p[slot_gamma_k]  : 0.0; }
+
+  // A vector in the full layout, whatever length the caller passed.
+  inline param_t pad_params(const param_t& p) {
+    param_t out(p);
+    if (out.size() < n_params) out.resize(n_params, 0.0);
+    return out;
+  }
+  inline std::vector<int> pad_model_bin(const std::vector<int>& m) {
+    std::vector<int> out(m);
+    if (out.size() < n_covariates) out.resize(n_covariates, 0);
+    return out;
+  }
+
+  using reng_t = std::mt19937_64;   // the one engine type; we need doubles
+
+
+  // -------------------------------------------------------------------------
+  // Seeding of the C++ samplers.
+  //
+  // The thinning augmenter (src/augment_tree.cpp), the extinction-time draw in
+  // Model::extinction_time below and the forward simulator
+  // (inst/include/general_tree.hpp) each held an engine seeded from the wall
+  // clock XOR the thread id.  set.seed() did not reach any of them -- 0 of 4
+  // repeats identical against 4 of 4 for the pure-R BDI path -- and a
+  // thread_local engine is copied byte for byte into every forked child, so
+  // the children of a primed parent drew the same numbers rather than
+  // independent ones (H47).
+  //
+  // An Rcpp entry point now opens a stream epoch with rng::set_seed(s), where
+  // s is the integer the R layer passed: sample.int(.Machine$integer.max, 1L)
+  // by default, so set.seed() propagates and a forked child, whose R stream
+  // differs from its parent's, draws its own s.  Within an epoch each thread
+  // draws from one substream, seeded from a std::seed_seq over (s, substream);
+  // the substream is the TBB worker index, or an item index where the caller
+  // has one, which is what keeps parallel workers independent of each other
+  // while every one of them stays a function of s alone.
+  //
+  // Re-seeding happens when the epoch or the substream changes, not once per
+  // call: re-seeding a thread to its own substream on every call would hand
+  // every call on that thread the same draws.
+  namespace rng {
+
+    namespace detail_rng {
+
+      inline std::atomic<uint64_t>& seed_slot()
+      {
+        static std::atomic<uint64_t> s{ 0 };
+        return s;
+      }
+
+      // Bumped by every set_seed, so that a thread whose engine was seeded in
+      // an earlier epoch re-seeds on its next draw.  Not part of the seed: two
+      // calls carrying the same s must produce the same stream.
+      inline std::atomic<uint64_t>& epoch_slot()
+      {
+        static std::atomic<uint64_t> e{ 0 };
+        return e;
+      }
+
+      struct stream_t
+      {
+        reng_t eng{};
+        uint64_t epoch = ~uint64_t(0);   // never seeded
+        uint64_t sub = 0;
+      };
+
+      inline stream_t& local()
+      {
+        static thread_local stream_t s;
+        return s;
+      }
+
+      // std::seed_seq consumes 32-bit words, so each 64-bit input enters as
+      // its low and its high half.
+      inline reng_t make(uint64_t seed, uint64_t sub)
+      {
+        const uint32_t w[5] = {
+          static_cast<uint32_t>(seed), static_cast<uint32_t>(seed >> 32),
+          static_cast<uint32_t>(sub),  static_cast<uint32_t>(sub >> 32),
+          0x9e3779b9u
+        };
+        std::seed_seq sseq(w, w + 5);
+        return reng_t(sseq);
+      }
+
+    }
+
+
+    // Open a stream epoch: every thread re-seeds from `seed` on its next draw.
+    inline void set_seed(uint64_t seed)
+    {
+      detail_rng::seed_slot().store(seed);
+      detail_rng::epoch_slot().fetch_add(1);
+    }
+
+
+    // Put the calling thread on substream `sub` of the current epoch and hand
+    // back its engine.  Callers that know which worker or which item they are
+    // select the substream here; everything below them draws from engine().
+    inline reng_t& stream(uint64_t sub)
+    {
+      auto& s = detail_rng::local();
+      const uint64_t ep = detail_rng::epoch_slot().load();
+      if (s.epoch != ep || s.sub != sub) {
+        s.eng = detail_rng::make(detail_rng::seed_slot().load(), sub);
+        s.epoch = ep;
+        s.sub = sub;
+      }
+      return s.eng;
+    }
+
+
+    // The calling thread's engine, on the substream it is already on.
+    inline reng_t& engine()
+    {
+      return stream(detail_rng::local().sub);
+    }
+
+  }
+
+
+  // Link functions for rate computation
+  // 0 = linear:      rate = max(0, eta)
+  // 1 = exponential: rate = exp(eta)
+  enum class LinkType : int { linear = 0, exponential = 1 };
+
+  // Latent marks (dev/latent-marks/design.md): a state m in 0..S-1 that every
+  // lineage carries, unseen, and that multiplies its rates under the
+  // exponential link, lambda_s = exp(eta) * exp(log_clam[m]), mu_s likewise.
+  // The first version has no change along a branch (Q = 0): a mark changes
+  // only at a split, where the parent's mark m gives the two daughters (the
+  // continuing lineage and the new one) the marks (a, b) with probability
+  // C[(m * S + a) * S + b].  Which daughter continues is a convention of the
+  // lineage representation, so the kernel is read symmetrised in (a, b).  The
+  // two crown lineages arise from a root mark drawn from pi by the same kernel.
+  // When P (S x S, row m the law of one daughter's mark) is given, the two
+  // daughters draw independently and C is not read.
+  struct marks_t
+  {
+    int S = 1;
+    std::vector<double> log_clam{0.0}, log_cmu{0.0};
+    std::vector<double> C{1.0};
+    std::vector<double> P;
+    std::vector<double> pi{1.0};
+  };
+
+  // General diversification model
+  //
+  // Orthogonal covariate basis (per lineage s at event time t):
+  //   N       = number of alive lineages          (diversity level)
+  //   M = P/N = mean pendant age of alive lineages (maturity; P = sum of pendant ages)
+  //   D = E - M                                    (focal isolation relative to the
+  //                                                 clade mean; Sum_s D = 0)
+  //
+  // A lineage's pendant age at t is t - tip_start, where tip_start is the time
+  // it last became a pendant tip: its birth time, reset every time it
+  // speciates.  P = N*t - Sum_s tip_start_s is accumulated by the forward
+  // sweep in compute_pendant_pd() (src/augment_tree.cpp) and read off
+  // node.pd; E comes from node.focal_tip_start via e_s().  Both are the
+  // definitions the simulator uses (inst/include/general_tree.hpp).
+  //
+  // Parameters layout (always 8 elements); slots 2/6 are coefficients on M and
+  // slots 3/7 on D:
+  //   {beta_0, beta_N, beta_M, beta_D, gamma_0, gamma_N, gamma_M, gamma_D}
+  //
+  // model_bin_ = {use_N, use_M, use_D} selects active covariates.
+  // Inactive parameters should be 0 (and their bounds pinned to 0).
+  //
+  // Linear link (default):
+  //   lambda = max(0, beta_0  + beta_N*N  + beta_M*M  + beta_D*D)
+  //   mu     = max(0, gamma_0 + gamma_N*N + gamma_M*M + gamma_D*D)
+  //
+  // Exponential link:
+  //   lambda = exp(beta_0  + beta_N*N  + beta_M*M  + beta_D*D)
+  //   mu     = exp(gamma_0 + gamma_N*N + gamma_M*M + gamma_D*D)
+  //
+  class Model
+  {
+  public:
+    // Full constructor: 8-element bounds + model binary vector + link type + rho
+    Model(const param_t& lb8, const param_t& ub8,
+          const std::vector<int>& model_bin,
+          int link = 0,
+          double rho = 1.0)
+      : lower_bound_(pad_params(lb8)), upper_bound_(pad_params(ub8)),
+        model_bin_(pad_model_bin(model_bin)),
+        link_(static_cast<LinkType>(link)), rho_(rho)
+    {
+      if (model_bin_.size() != n_covariates) model_bin_ = std::vector<int>(n_covariates, 0);
+      // Every rate below branches on linear or exponential only, so any other
+      // code would be read as linear; it is refused instead.
+      if (link != 0 && link != 1) {
+        throw std::invalid_argument("link must be 0 (linear) or 1 (exponential) (got " +
+          std::to_string(link) + ")");
+      }
+      // Substituting 1 here made an out-of-range rho return the complete-
+      // sampling likelihood with no signal; eval_logf, augment_trees and
+      // em_cpp are exported, so an R-side check alone does not cover it.
+      if (!(rho_ > 0.0) || rho_ > 1.0) {
+        throw std::invalid_argument("rho must be in (0, 1] (got " +
+          std::to_string(rho_) + ")");
+      }
+    }
+
+    // Legacy constructor: maps old 4-param rpd5c layout to 8-param
+    Model(const param_t& lb, const param_t& ub)
+      : model_bin_({1, 1, 0, 0}), link_(LinkType::linear)
+    {
+      if ((lb.size() == 8 || lb.size() == n_params) && lb.size() == ub.size()) {
+        lower_bound_ = pad_params(lb);
+        upper_bound_ = pad_params(ub);
+      } else {
+        lower_bound_ = {lb.size() > 1 ? lb[1] : 0, lb.size() > 2 ? lb[2] : 0,
+                        lb.size() > 3 ? lb[3] : 0, 0,
+                        lb.size() > 0 ? lb[0] : 0, 0, 0, 0};
+        upper_bound_ = {ub.size() > 1 ? ub[1] : 0, ub.size() > 2 ? ub[2] : 0,
+                        ub.size() > 3 ? ub[3] : 0, 0,
+                        ub.size() > 0 ? ub[0] : 0, 0, 0, 0};
+        lower_bound_ = pad_params(lower_bound_);
+        upper_bound_ = pad_params(upper_bound_);
+      }
+    }
+
+   ~Model() = default;
+
+    const char* description() const { return "general diversification model"; }
+    bool is_threadsafe() const { return true; }
+    int nparams() const { return static_cast<int>(n_params); }
+    const std::vector<int>& model_bin() const { return model_bin_; }
+    bool uses_ed() const { return model_bin_[3] != 0; }
+    // K, the number of speciation events on the path from the crown to the
+    // lineage: constant between events, one more on both daughters at a
+    // split, hidden splits counted.  Per lineage like ED, so a K model takes
+    // the per-lineage likelihood and the per-lineage (ED-aware) proposal.
+    bool uses_k() const { return model_bin_[4] != 0; }
+    bool lineage_proposal() const { return ed_proposal() || uses_k() || has_offsets(); }
+
+    // Per-lineage offsets of the proposal's speciation predictor: the
+    // mark-aware proposal (dev/latent-marks/design.md) sets them to the log of
+    // each observed lineage's posterior mean rate multiplier.  An observed
+    // lineage id holds pieces (from, to, offset) over its stretches; a lineage
+    // not observed reads its nearest observed ancestor's offset at the time it
+    // branched off.  With offsets set the thinning sampler takes the
+    // per-lineage proposal and sampling_prob its density, both adding the
+    // offset to every eta_s, so the density stays the sampler's.
+    struct offset_piece_t { double from, to, off, off_mu; };
+    // off_mu (optional, same length) offsets the extinction rate a missing
+    // lineage's lifetime is drawn at, read off its parent.
+    void set_lineage_offsets(const std::vector<int>& id, const std::vector<double>& from,
+                             const std::vector<double>& to, const std::vector<double>& off,
+                             const std::vector<double>& off_mu = {}) {
+      if (id.size() != from.size() || id.size() != to.size() || id.size() != off.size() ||
+          (!off_mu.empty() && off_mu.size() != id.size())) {
+        throw std::invalid_argument("lineage offsets: id, from, to, offset and offset_mu differ in length");
+      }
+      auto m = std::make_shared<std::unordered_map<int, std::vector<offset_piece_t>>>();
+      for (std::size_t i = 0; i < id.size(); ++i)
+        (*m)[id[i]].push_back({from[i], to[i], off[i], off_mu.empty() ? 0.0 : off_mu[i]});
+      for (auto& kv : *m) std::sort(kv.second.begin(), kv.second.end(),
+                                    [](const offset_piece_t& a, const offset_piece_t& b) { return a.from < b.from; });
+      offsets_ = m;
+    }
+    bool has_offsets() const { return offsets_ && !offsets_->empty(); }
+    bool lineage_loglik() const { return uses_ed() || uses_k(); }
+    // With the covariate active, model_bin[3] also selects the proposal the
+    // thinning sampler draws from: 1 the ED-aware proposal (ed_proposal_seg_t
+    // below), 2 the mean-field one (nh_rate), kept so that the two can be run
+    // on the same trees and compared.
+    bool ed_proposal() const { return model_bin_[3] == 1 || model_bin_[3] == 3; }
+    // Codes 3 and 4 are the same two proposals on the centred covariate
+    // ED* = ED - mean over the lineages alive at t.  Within a segment every
+    // ED_s(t) grows at slope one, so the clade mean does too and ED*_s is
+    // constant on the segment: the rate keeps the per-lineage constant
+    // k_s = c_s - ts_s minus its segment mean, and loses its slope in t.
+    bool ed_centred() const { return model_bin_[3] >= 3; }
+
+    // Apply link function to linear predictor
+    double apply_link(double eta) const {
+      if (link_ == LinkType::exponential) {
+        return std::exp(eta);
+      }
+      return std::max(0.0, eta);
+    }
+
+    // ---------------------------------------------------------------------
+    // Orthogonal covariate basis {N, M, D}:
+    //   N       = node.n                     (lineage count / diversity level)
+    //   M = P/N = node.pd / node.n           (mean pendant age / "maturity",
+    //                                         over the N lineages alive on the
+    //                                         segment that ends at the node)
+    //   D = E - M                            (focal lineage's isolation
+    //                                         relative to the clade mean; Σ_s D = 0)
+    // The parameter slots are reused: pars[2]/pars[6] are now coefficients on M
+    // (beta_M / gamma_M) and pars[3]/pars[7] on D (beta_D / gamma_D).
+    // ---------------------------------------------------------------------
+
+    // Mean pendant age M = P/N (global covariate).
+    double m_cov(const node_t& node) const {
+      return (node.n > 0.0) ? (node.pd / node.n) : 0.0;
+    }
+
+    // Speciation rate (no-D path: eta = beta_0 + beta_N*N + beta_M*M)
+    double speciation_rate(const param_t& pars, const node_t& node) const {
+      const double M = m_cov(node);
+      const double eta = pars[0] + pars[1] * node.n + pars[2] * M;
+      return apply_link(eta);
+    }
+
+    // Extinction rate (no-D path)
+    double extinction_rate(const param_t& pars, const node_t& node) const {
+      const double M = m_cov(node);
+      const double eta = pars[4] + pars[5] * node.n + pars[6] * M;
+      return apply_link(eta);
+    }
+
+    // Raw focal isolation E_s = pendant age of the focal lineage at event time.
+    //
+    // For extinction nodes: E = brts - tip_start (the dying lineage's own
+    //   tip_start, reset by any split it made since its birth).
+    // For an event whose splitting lineage is on record: E = brts -
+    //   focal_tip_start.  That covers every observed branching event of a tree
+    //   passed with its topology and every augmented lineage drawn from a
+    //   recorded parent.
+    // For an event whose splitting lineage is not on record (focal_tip_start
+    //   is ts_unknown: a branching-time vector with no topology, or a lineage
+    //   drawn when nothing was on record): E = P/N = M, a mean-field
+    //   marginalization over possible parents, which sets D = E - M = 0.
+    double e_s(const node_t& node) const {
+      if (detail::is_extinction(node)) {
+        return node.brts - node.tip_start;
+      }
+      if (node.focal_tip_start >= 0.0) {
+        return node.brts - node.focal_tip_start;
+      }
+      return (node.n > 0.0) ? (node.pd / node.n) : 0.0;
+    }
+
+    // Centered focal deviation D = E - M.
+    double d_cov(const node_t& node) const {
+      return e_s(node) - m_cov(node);
+    }
+
+    // Per-lineage speciation rate:
+    //   eta = beta_0 + beta_N*N + beta_M*M + beta_D*D + beta_ED*ED + beta_K*K
+    // `ed` is the focal lineage's evolutionary distinctiveness at the event
+    // (ed_covariate.hpp) and `kk` its ancestral-split count, 0 when the
+    // covariate is inactive; the terms are then absent and this is the
+    // D-aware rate the package always had.
+    double speciation_rate_ep(const param_t& pars, const node_t& node, double ed = 0.0,
+                              double kk = 0.0) const {
+      const double M = m_cov(node);
+      const double D = e_s(node) - M;
+      return apply_link(pars[0] + pars[1] * node.n + pars[2] * M + pars[3] * D
+                        + beta_ed(pars) * ed + beta_k(pars) * kk);
+    }
+
+    // Per-lineage extinction rate (exact D for extinction nodes, mean-field
+    // D = 0 otherwise; ED and K as for speciation).
+    double extinction_rate_ep(const param_t& pars, const node_t& node, double ed = 0.0,
+                              double kk = 0.0) const {
+      const double M = m_cov(node);
+      const double D = e_s(node) - M;
+      return apply_link(pars[4] + pars[5] * node.n + pars[6] * M + pars[7] * D
+                        + gamma_ed(pars) * ed + gamma_k(pars) * kk);
+    }
+
+    // -----------------------------------------------------------------------
+    // The lineage forest a node list describes, for the ED covariate.
+    //
+    // Lineage 0 and 1 are the two crown lineages; every other lineage is the
+    // one born at a non-extinction node, in node order.  A lineage's death is
+    // the time of the extinction node that names it, or +inf.  `complete` is
+    // false when a non-crown lineage has no parent on record, which happens
+    // for a bare branching-time vector: ED cannot be computed then, and the
+    // caller refuses rather than guesses.
+    // -----------------------------------------------------------------------
+    struct forest_t {
+      std::vector<int>    parent;
+      std::vector<double> birth;
+      std::vector<double> death;
+      std::vector<int>    node_lineage;   // per node: lineage index of the lineage it names (-1 for the present marker)
+      std::vector<int>    lineage_node;   // per lineage: the node it was born at (-1 for a crown lineage)
+      std::vector<int>    kbase;          // per lineage: its K at birth (the parent's K just after the split)
+      std::vector<std::vector<double>> splits;   // per lineage: the births of its children, sorted
+      std::unordered_map<int, int> idx;   // lineage id -> index
+      ed::forest_index    ix;             // birth order and children, built once per tree
+      bool complete = true;
+      int lookup(int id) const {
+        auto it = idx.find(id);
+        return it == idx.end() ? -1 : it->second;
+      }
+    };
+
+    static forest_t build_forest(const tree_t& tree) {
+      forest_t f;
+      const double inf = std::numeric_limits<double>::infinity();
+      std::vector<int> nchild;            // per lineage: its splits so far, in node order
+      auto add = [&](int id, int parent_idx, double birth, double death, int node_i) {
+        const int k = static_cast<int>(f.parent.size());
+        f.parent.push_back(parent_idx);
+        f.birth.push_back(birth);
+        f.death.push_back(death);
+        f.lineage_node.push_back(node_i);
+        // Children are added in birth order, so the parent's split count at
+        // this birth is its K on the daughter: K restarts nothing, it counts.
+        if (parent_idx >= 0) {
+          const std::size_t p = static_cast<std::size_t>(parent_idx);
+          f.kbase.push_back(f.kbase[p] + (++nchild[p]));
+          f.splits[p].push_back(birth);          // nodes come in time order, so this stays sorted
+        } else {
+          f.kbase.push_back(0);
+        }
+        nchild.push_back(0);
+        f.splits.emplace_back();
+        if (id != no_parent) f.idx[id] = k;
+        return k;
+      };
+      add(crown_id_a, ed::no_parent_idx, 0.0, inf, -1);
+      add(crown_id_b, ed::no_parent_idx, 0.0, inf, -1);
+      f.node_lineage.assign(tree.size(), -1);
+      const std::size_t last = tree.size() - 1;
+      for (std::size_t i = 0; i < tree.size(); ++i) {
+        const auto& node = tree[i];
+        if (is_extinction(node)) {
+          const int k = f.lookup(node.id);
+          f.node_lineage[i] = k;
+          if (k >= 0) f.death[static_cast<std::size_t>(k)] = node.brts;
+          continue;
+        }
+        if (i == last) continue;                       // the present marker is not a lineage
+        const int p = f.lookup(node.parent_id);
+        if (p < 0) f.complete = false;
+        const double death = is_missing(node) ? node.t_ext : inf;
+        f.node_lineage[i] = add(node.id, p, node.brts, death, static_cast<int>(i));
+      }
+      f.ix.build(f.parent, f.birth);
+      return f;
+    }
+
+    // Each lineage's split times: the births of its children, kept on the
+    // forest (forest_t::splits).  A lineage's pendant start at time t is its
+    // last split at or before t, or its birth -- the rule the forward sweep
+    // applies to node.pd and the event terms read through focal_tip_start.
+    static const std::vector<std::vector<double>>& lineage_splits(const forest_t& f) {
+      return f.splits;
+    }
+    static double pendant_start(const std::vector<std::vector<double>>& splits,
+                                const forest_t& f, std::size_t k, double t) {
+      const auto& v = splits[k];
+      auto it = std::upper_bound(v.begin(), v.end(), t);
+      return (it == v.begin()) ? f.birth[k] : *(it - 1);
+    }
+    // K of lineage k at time t: its K at birth plus its own splits at or
+    // before t.  On the segment (t0, t1] it is the value at t0, which is also
+    // the value the event at t1 is charged with (a split at t1 is not yet on
+    // the path).
+    static double lineage_k(const std::vector<std::vector<double>>& splits,
+                            const forest_t& f, std::size_t k, double t) {
+      const auto& v = splits[k];
+      auto it = std::upper_bound(v.begin(), v.end(), t);
+      return static_cast<double>(f.kbase[k] + static_cast<int>(it - v.begin()));
+    }
+
+    // One row per lineage alive on each segment of an augmented tree: the
+    // covariates the rates read there, and which lineage's event ends the
+    // segment.  This is the design the likelihood is built on, exposed so that
+    // a path over the covariates (covariate_path in R) can be run on the same
+    // numbers the M-step maximises.
+    struct lineage_rows_t {
+      std::vector<int>    seg, lin, id, ev;      // ev: 0 none, 1 speciates at t1, 2 dies at t1
+      std::vector<double> t0, t1, N, M, ts, ed0; // ts: pendant start; ed0: ED at t0 (slope one after)
+      std::vector<double> K;                     // ancestral splits on the segment
+    };
+    lineage_rows_t lineage_table(const tree_t& tree) const {
+      forest_t forest = build_forest(tree);
+      if (!forest.complete) {
+        throw std::invalid_argument(
+          "the lineage table needs the tree's topology: pass a phylo object, not a "
+          "bare branching-time vector");
+      }
+      const auto& splits = forest.splits;
+      lineage_rows_t out;
+      std::vector<char> alive;
+      ed::result_t edr;
+      const std::size_t last = tree.size() - 1;
+      double prev = 0.0;
+      for (std::size_t i = 0; i < tree.size(); ++i) {
+        const auto& node = tree[i];
+        const double t0 = prev, t1 = node.brts;
+        if (t1 > t0) {
+          segment_ed(forest, t0, t1, alive, edr);
+          const double N = node.n;
+          const double M = (N > 0.0) ? node.pd / N : 0.0;
+          int ev_lin = -1, ev = 0;
+          if (is_extinction(node)) { ev_lin = forest.node_lineage[i]; ev = 2; }
+          else if (i != last)      { ev_lin = forest.lookup(node.parent_id); ev = 1; }
+          for (std::size_t k = 0; k < alive.size(); ++k) {
+            if (!alive[k]) continue;
+            const int ni = forest.lineage_node[k];
+            out.seg.push_back(static_cast<int>(i));
+            out.lin.push_back(static_cast<int>(k));
+            out.id.push_back(ni < 0 ? (k == 0 ? crown_id_a : crown_id_b)
+                                    : tree[static_cast<std::size_t>(ni)].id);
+            out.ev.push_back(static_cast<int>(k) == ev_lin ? ev : 0);
+            out.t0.push_back(t0); out.t1.push_back(t1);
+            out.N.push_back(N); out.M.push_back(M);
+            out.ts.push_back(pendant_start(splits, forest, k, t0));
+            out.ed0.push_back(edr.c[k] + (t0 - edr.ts[k]));
+            out.K.push_back(lineage_k(splits, forest, k, t0));
+          }
+        }
+        prev = t1;
+      }
+      return out;
+    }
+
+    // ED constants for the lineages alive on the segment (t0, t1]: alive means
+    // born at or before t0 and not dead before t1, the alive set the
+    // compensator's other branches use.  No allocation beyond the reused
+    // buffers: this runs once per segment per likelihood evaluation.
+    static void segment_ed(const forest_t& f, double t0, double t1,
+                           std::vector<char>& alive, ed::result_t& out) {
+      const std::size_t n = f.parent.size();
+      alive.resize(n);
+      for (std::size_t i = 0; i < n; ++i)
+        alive[i] = (f.birth[i] <= t0 && f.death[i] >= t1) ? 1 : 0;
+      ed::fair_proportion(f.ix, f.parent, f.birth, alive, t0, out);
+    }
+
+    // Draw extinction time from truncated exponential with rate = mu at speciation time.
+    // With rho < 1, the lineage may be an unsampled extant species (returns t > T).
+    // Caller should check: if result >= T, treat as unsampled tip (t_ext = t_ext_tip).
+    //
+    // The rate is the segment's mu (proposal_rates), the same one the survival
+    // factor of nh_rate used to decide that the lineage is missing at all and
+    // the same one sampling_prob charges the lifetime with.
+    double extinction_time(double t_speciation, const param_t& pars, const tree_t& tree) const {
+      const node_t* first = reinterpret_cast<const node_t*>(tree.data());
+      auto it = lower_bound_node(t_speciation, tree.size(), first);
+      double lambda = 0.0, mu = 0.0;
+      proposal_rates(pars, *it, segment_start(it, first), lambda, mu);
+      (void)lambda;
+      return extinction_time_at(t_speciation, mu, tree.back().brts);
+    }
+
+    // The lifetime draw itself, at a given rate: the ED-aware proposal calls
+    // this with the rate of its own segment.
+    double extinction_time_at(double t_speciation, double mu, double T) const {
+      // The stream the augmentation that called this is already drawing from,
+      // so the lifetime and the birth times it goes with come off one seeded
+      // engine rather than off a second, clock-seeded one.
+      reng_t& reng_ = rng::engine();
+      const double remaining = T - t_speciation;
+      if (rho_ < 1.0) {
+        // P(unsampled extant) = (1-rho)*exp(-mu*remaining) / (1 - rho*exp(-mu*remaining))
+        double surv = std::exp(-mu * remaining);
+        double p_unsampled = (1.0 - rho_) * surv / (1.0 - rho_ * surv);
+        double u = std::uniform_real_distribution<>()(reng_);
+        if (u < p_unsampled) {
+          return T + 1.0;  // sentinel: unsampled extant species
+        }
+      }
+      return t_speciation + emphasis::detail::trunc_exp(remaining, mu, reng_);
+    }
+
+    // Pendant PD at an arbitrary time inside the segment `node` governs.
+    //
+    // node.pd is P at the node's own time over the N = node.n lineages alive on
+    // the segment that ends there.  No lineage is born and none dies strictly
+    // inside a segment, so on it both N and S = Sum_s tip_start_s are constant
+    // and P is the straight line through (node.brts, node.pd) with slope N:
+    //
+    //   P(t) = N*t - S = node.pd + node.n * (t - node.brts)
+    //
+    // This is the one definition of P the model has.  The scorer reads it at
+    // the nodes (node.pd itself); the sampler, which needs it at candidate
+    // times between them, reads it here, so the two cannot disagree.  Exact,
+    // and O(1) rather than a scan over the event list.
+    static double pendant_pd(const node_t& node, double t) {
+      return node.pd + node.n * (t - node.brts);
+    }
+
+    // The pendant PD at t, off the node that governs the segment t falls in.
+    //
+    // lower_bound_node returns the first node with brts >= t, which is the node
+    // whose segment (brts_{i-1}, brts_i] contains t: its (pd, n, brts) are the
+    // ones in force there.  Verified against the topology in
+    // tests/testthat/test-d-compensator.R.
+    double pendant_pd_at(double t, const tree_t& tree) const {
+      auto it = lower_bound_node(t,
+                                 tree.size(),
+                                 reinterpret_cast<const node_t*>(tree.data()));
+      return pendant_pd(*it, t);
+    }
+
+    // The time at which the segment ending at `it` begins: the previous node's
+    // time, or 0 for the first segment.
+    static double segment_start(const node_t* it, const node_t* first) {
+      return (it == first) ? 0.0 : (it - 1)->brts;
+    }
+
+    // The two rates the proposal holds on the segment (t0, node.brts].
+    //
+    // The proposal reads only the alive set: the diversity N = node.n and the
+    // mean pendant age M = P/N, with P extrapolated to the time the segment
+    // begins.  It never reads D.  That is what makes the sampler and the
+    // scorer read the same numbers: a birth splits the segment it falls in, so
+    // the sampler (which sees the segment whole) and the scorer (which sees
+    // the two halves) disagree about which node ends it, but they agree about
+    // the alive set on it and about where it begins.
+    //
+    // Under the linear link Sum_s D_s = 0 over the alive lineages, so
+    // N * lambda(N, M) is the model's own total speciation intensity whenever
+    // no lineage's rate is clipped at zero.
+    void proposal_rates(const param_t& pars, const node_t& node, double t0,
+                        double& lambda, double& mu) const {
+      node_t cur = node;
+      cur.pd = pendant_pd(node, t0);
+      lambda = speciation_rate(pars, cur);
+      mu = std::max(extinction_rate(pars, cur), 1e-10);
+    }
+
+    // The intensity of the thinning sampler's birth process:
+    //
+    //   nh(t) = N * lambda_seg * (1 - rho * exp(-mu_seg * (T - t)))
+    //
+    // lambda_seg and mu_seg are the segment's rates (proposal_rates) and the
+    // survival factor is the probability that a lineage born at t leaves no
+    // sampled descendant, under a lifetime that is exponential with rate
+    // mu_seg.  Only that factor carries t, and it falls with t, so nh is
+    // decreasing on every segment and its value where the segment begins
+    // dominates it there — for every model and every link.
+    double nh_rate(double t, const param_t& pars, const tree_t& tree) const {
+      const node_t* first = reinterpret_cast<const node_t*>(tree.data());
+      auto it = lower_bound_node(t, tree.size(), first);
+      double lambda = 0.0, mu = 0.0;
+      proposal_rates(pars, *it, segment_start(it, first), lambda, mu);
+      const double T = tree.back().brts;
+      return lambda * it->n * (1.0 - rho_ * std::exp(-mu * (T - t)));
+    }
+
+    // -----------------------------------------------------------------------
+    // The ED-aware proposal (model_bin[3] == 1).
+    //
+    // With the ED covariate active the model's speciation rate is per lineage,
+    // lambda_s(t) = link(eta_s(t)), and its total over the alive lineages is
+    // the rate at which the augmentation's missing births should be drawn.
+    // The mean-field proposal (nh_rate) draws them at N * lambda(N, M), the
+    // rate at ED = 0, which under a negative beta_ED sits far above the
+    // model's total, and it attaches each birth to a lineage drawn uniformly,
+    // which under the model may have rate zero.  The main tier of the ED
+    // simulation arm (ed-diversification, 2026-09-18) measured what that
+    // costs: at turnover 0.5 the ESS of 200 draws was 1-7 and the ED
+    // coefficients never left their start.
+    //
+    // On the segment (t0, t1] this proposal holds, per alive lineage s,
+    //
+    //   eta_s(t) = beta_0 + beta_N N + beta_M M + beta_ED ED_s(t),
+    //   ED_s(t)  = ED_s(t0) + (t - t0),
+    //
+    // with N and M = P(t0)/N the segment's values (D is never read, as in
+    // proposal_rates), so every eta_s is affine in t with slope beta_ED.  It
+    // draws
+    //
+    //   birth times  a Poisson process of intensity
+    //                nh(t) = S(t) Lambda(t),  Lambda(t) = sum_s lambda_s(t),
+    //                S(t) = 1 - rho exp(-mu_bar (T - t)),
+    //                by thinning a homogeneous process at envelope();
+    //   a parent     lineage p with probability w_p lambda_p(t) / sum_s w_s
+    //                lambda_s(t), w = 2 for an observed lineage and 1 for an
+    //                augmented one (the labelled attachments sampling_prob
+    //                counts);
+    //   a lifetime   as the mean-field proposal does, at the segment's rate
+    //                mu_bar = link(gamma_0 + gamma_N N + gamma_M M + gamma_ED
+    //                mean_s ED_s(t0)), floored at 1e-10.
+    //
+    // At beta_ED = gamma_ED = 0 every lambda_s is lambda(N, M), the intensity
+    // is N lambda S(t), the parent draw is uniform over the attachments and
+    // mu_bar is the mean-field mu: the mean-field proposal, term for term,
+    // which is what test-ed-proposal.R holds the density to.
+    //
+    // Lambda(t) under the linear link is a sum of lines clipped at zero, so
+    // with the eta_s sorted it is one binary search and two prefix sums;
+    // under the exponential link it is exp(beta_ED (t - t0)) times a
+    // constant.  The compensator int nh dt has a closed form on each piece
+    // where no line is clipped (piece() below), and the sum of lines is a
+    // line, so an unclipped segment costs O(1) and a clipped one O(n).
+    // -----------------------------------------------------------------------
+    struct ed_proposal_seg_t {
+      double t0 = 0.0, t1 = 0.0, T = 0.0, rho = 1.0;
+      LinkType link = LinkType::linear;
+      double b = 0.0;            // slope of eta_s in t: beta_ED
+      double mu_bar = 1e-10;     // the segment's extinction rate
+      std::vector<int>    id;    // lineage id, for the sampler's parent draw
+      std::vector<double> eta;   // eta_s(t0)
+      std::vector<char>   w;     // labelled attachments: 2 observed, 1 augmented
+      std::vector<double> off_mu; // extinction offsets per lineage (the mark-aware proposal)
+      std::vector<double> eta_sorted, eta_prefix;   // linear link
+      double sum_exp_eta = 0.0;                     // exponential link
+      std::vector<double> scratch;
+
+      std::size_t size() const { return eta.size(); }
+
+      void clear() { id.clear(); eta.clear(); w.clear(); off_mu.clear(); }
+
+      // Called once the per-lineage entries are in.
+      void finish() {
+        const std::size_t n = eta.size();
+        if (link == LinkType::exponential) {
+          sum_exp_eta = 0.0;
+          for (double e : eta) sum_exp_eta += std::exp(e);
+        } else {
+          eta_sorted = eta;
+          std::sort(eta_sorted.begin(), eta_sorted.end());
+          eta_prefix.assign(n + 1, 0.0);
+          for (std::size_t k = 0; k < n; ++k) eta_prefix[k + 1] = eta_prefix[k] + eta_sorted[k];
+        }
+      }
+
+      double lambda_s(std::size_t k, double t) const {
+        const double e = eta[k] + b * (t - t0);
+        return (link == LinkType::exponential) ? std::exp(e) : std::max(0.0, e);
+      }
+
+      // sum_s lambda_s(t)
+      double Lambda(double t) const {
+        const double dt = t - t0;
+        if (link == LinkType::exponential) return sum_exp_eta * std::exp(b * dt);
+        // lambda_s(t) > 0 iff eta_s > -b dt
+        const double theta = -b * dt;
+        const std::size_t n = eta_sorted.size();
+        const std::size_t k = static_cast<std::size_t>(
+          std::upper_bound(eta_sorted.begin(), eta_sorted.end(), theta) - eta_sorted.begin());
+        return (eta_prefix[n] - eta_prefix[k]) + static_cast<double>(n - k) * b * dt;
+      }
+
+      double survival(double t) const { return 1.0 - rho * std::exp(-mu_bar * (T - t)); }
+      double nh(double t) const { return survival(t) * Lambda(t); }
+
+      // nh on (t0, t1] is dominated by the product of its two factors' maxima:
+      // S falls with t; Lambda falls with t when b <= 0 and rises when b > 0.
+      double envelope() const { return survival(t0) * Lambda(b > 0.0 ? t1 : t0); }
+
+      // The mark of one labelled attachment of lineage k: lambda_k(t) /
+      // sum_j w_j lambda_j(t).  Lineage k is drawn with probability w_k times
+      // this, and a labelled augmentation names one of its w_k attachments,
+      // as sampling_prob's -log K prices one of the K.
+      double log_mark(std::size_t k, double t) const {
+        const double num = lambda_s(k, t);
+        double den = 0.0;
+        for (std::size_t j = 0; j < eta.size(); ++j) den += static_cast<double>(w[j]) * lambda_s(j, t);
+        if (!(num > 0.0) || !(den > 0.0)) return -std::numeric_limits<double>::infinity();
+        return std::log(num) - std::log(den);
+      }
+
+      // A parent, with probability proportional to w_s lambda_s(t).
+      std::size_t draw_parent(double t, reng_t& reng) {
+        const std::size_t n = eta.size();
+        scratch.resize(n);
+        double total = 0.0;
+        for (std::size_t j = 0; j < n; ++j) {
+          total += static_cast<double>(w[j]) * lambda_s(j, t);
+          scratch[j] = total;
+        }
+        const double u = std::uniform_real_distribution<>()(reng) * total;
+        std::size_t k = static_cast<std::size_t>(
+          std::upper_bound(scratch.begin(), scratch.end(), u) - scratch.begin());
+        return (k < n) ? k : n - 1;
+      }
+
+      // int_lo^hi (a + bb t) (1 - rho e^{-mu (T - t)}) dt, written so that
+      // mu -> 0 is exact rather than a cancellation: with u = t - lo,
+      //   int_0^L (a + bb lo + bb u) e^{mu u} du = (a + bb lo) I0 + bb I1,
+      //   I0 = (e^{mu L} - 1) / mu -> L,   I1 = (L mu e^{mu L} - (e^{mu L} - 1)) / mu^2 -> L^2/2.
+      double piece(double a, double bb, double lo, double hi) const {
+        const double L = hi - lo;
+        const double lin = a * L + 0.5 * bb * (hi * hi - lo * lo);
+        const double mL = mu_bar * L;
+        double I0, I1;
+        if (mL < 1e-4) {
+          I0 = L * (1.0 + 0.5 * mL + mL * mL / 6.0);
+          I1 = L * L * (0.5 + mL / 3.0 + mL * mL / 8.0);
+        } else {
+          const double em1 = std::expm1(mL);
+          I0 = em1 / mu_bar;
+          I1 = (L * mu_bar * (em1 + 1.0) - em1) / (mu_bar * mu_bar);
+        }
+        return lin - rho * std::exp(-mu_bar * (T - lo)) * ((a + bb * lo) * I0 + bb * I1);
+      }
+
+      // int_{t0}^{t1} nh(t) dt
+      double compensator() const {
+        if (t1 <= t0 || eta.empty()) return 0.0;
+        if (link == LinkType::exponential) {
+          const double L = t1 - t0;
+          const double first  = (std::abs(b) < 1e-12) ? L : std::expm1(b * L) / b;
+          const double c      = b + mu_bar;
+          const double second = (std::abs(c) < 1e-12) ? L : std::expm1(c * L) / c;
+          return sum_exp_eta * (first - rho * std::exp(-mu_bar * (T - t0)) * second);
+        }
+        // Linear link.  Unclipped on the whole segment when the smallest
+        // eta_s is positive at both ends; then the sum of the lines is a line.
+        const double emin = eta_sorted.front();
+        if (emin > 0.0 && emin + b * (t1 - t0) > 0.0) {
+          const double n = static_cast<double>(eta.size());
+          return piece(eta_prefix.back() - n * b * t0, n * b, t0, t1);
+        }
+        double sum = 0.0;
+        for (double e : eta) {
+          const double a = e - b * t0;               // eta_s(t) = a + b t
+          double lo = t0, hi = t1;
+          if (b != 0.0) {
+            const double root = -a / b;
+            if (b > 0.0) lo = std::max(lo, root); else hi = std::min(hi, root);
+          } else if (a <= 0.0) {
+            continue;
+          }
+          if (hi <= lo) continue;
+          sum += piece(a, b, lo, hi);
+        }
+        return sum;
+      }
+    };
+
+    // The proposal's linear predictors: the D-free arguments of
+    // speciation_rate / extinction_rate with the ED term added.
+    double proposal_eta_lambda(const param_t& pars, double N, double M, double ed,
+                               double kk = 0.0) const {
+      return pars[0] + pars[1] * N + pars[2] * M + beta_ed(pars) * ed + beta_k(pars) * kk;
+    }
+    double proposal_eta_mu(const param_t& pars, double N, double M, double ed,
+                           double kk = 0.0) const {
+      return pars[4] + pars[5] * N + pars[6] * M + gamma_ed(pars) * ed + gamma_k(pars) * kk;
+    }
+
+    // The offset of lineage k at time t (0 without offsets, or for an id with
+    // none); `mu` selects the extinction offset.
+    double lineage_offset(const forest_t& f, const tree_t& tree, std::size_t k, double t, bool mu = false) const {
+      if (!has_offsets()) return 0.0;
+      std::size_t kk = k; double tt = t;
+      for (;;) {
+        const int ni = f.lineage_node[kk];
+        if (ni < 0 || is_tip(tree[static_cast<std::size_t>(ni)])) break;
+        const int p = f.parent[kk];
+        if (p < 0) return 0.0;
+        tt = f.birth[kk]; kk = static_cast<std::size_t>(p);
+      }
+      const int ni = f.lineage_node[kk];
+      const int id = ni < 0 ? (kk == 0 ? crown_id_a : crown_id_b) : tree[static_cast<std::size_t>(ni)].id;
+      auto it = offsets_->find(id);
+      if (it == offsets_->end() || it->second.empty()) return 0.0;
+      const auto& v = it->second;
+      auto pc = std::upper_bound(v.begin(), v.end(), tt, [](double x, const offset_piece_t& q) { return x < q.from; });
+      const offset_piece_t& q = (pc == v.begin()) ? v.front() : *(pc - 1);
+      return mu ? q.off_mu : q.off;
+    }
+
+    // The proposal on the segment (t0, t1] that `node` governs, from the
+    // lineages alive there in `forest`.  `alive` and `edr` are reusable
+    // scratch; the sampler calls this once per segment, with a forest it
+    // rebuilds only after an insertion.
+    void ed_proposal_segment(const param_t& pars, const tree_t& tree, const node_t& node,
+                             double t0, double t1, const forest_t& forest,
+                             std::vector<char>& alive, ed::result_t& edr,
+                             ed_proposal_seg_t& seg) const {
+      segment_ed(forest, t0, t1, alive, edr);
+      const double N = node.n;
+      const double M = (N > 0.0) ? pendant_pd(node, t0) / N : 0.0;
+      seg.t0 = t0; seg.t1 = t1; seg.T = tree.back().brts; seg.rho = rho_; seg.link = link_;
+      const bool centred = ed_centred();
+      const bool with_k = uses_k();
+      seg.b = centred ? 0.0 : beta_ed(pars);
+      seg.clear();
+      double cED = 0.0;
+      if (centred) {
+        double s = 0.0; int m = 0;
+        for (std::size_t k = 0; k < alive.size(); ++k)
+          if (alive[k]) { s += edr.c[k] - edr.ts[k]; ++m; }
+        cED = m ? s / m : 0.0;
+      }
+      // K per alive lineage: its count at birth plus its own splits at or
+      // before t0, so the forest's split lists are needed only with K active.
+      const auto& splits = forest.splits;
+      double ed_sum = 0.0, k_sum = 0.0;
+      for (std::size_t k = 0; k < alive.size(); ++k) {
+        if (!alive[k]) continue;
+        const double ed0 = centred ? (edr.c[k] - edr.ts[k]) - cED
+                                   : edr.c[k] + (t0 - edr.ts[k]);
+        const double kk = with_k ? lineage_k(splits, forest, k, t0) : 0.0;
+        ed_sum += ed0; k_sum += kk;
+        const int ni = forest.lineage_node[k];
+        const bool observed = (ni < 0) || is_tip(tree[static_cast<std::size_t>(ni)]);
+        seg.id.push_back(ni < 0 ? (k == 0 ? crown_id_a : crown_id_b)
+                                : tree[static_cast<std::size_t>(ni)].id);
+        seg.eta.push_back(proposal_eta_lambda(pars, N, M, ed0, kk) + lineage_offset(forest, tree, k, t0));
+        seg.off_mu.push_back(lineage_offset(forest, tree, k, t0, true));
+        seg.w.push_back(observed ? 2 : 1);
+      }
+      const double n_al = static_cast<double>(seg.eta.size());
+      const double ed_bar = (n_al > 0.0) ? ed_sum / n_al : 0.0;
+      const double k_bar  = (n_al > 0.0) ? k_sum / n_al : 0.0;
+      seg.mu_bar = std::max(apply_link(proposal_eta_mu(pars, N, M, ed_bar, k_bar)), 1e-10);
+      seg.finish();
+    }
+
+
+    // log q(z | obs, theta): the log density of the augmentation the thinning
+    // sampler drew (src/augment_tree.cpp, do_augment_tree_cont).
+    //
+    // The sampler draws, in forward time,
+    //
+    //   birth times  an inhomogeneous Poisson process of intensity nh(t),
+    //                realised by thinning a homogeneous process of rate
+    //                nh(segment start) — a dominating envelope, since nh falls
+    //                within a segment — so the times have density
+    //                prod_k nh(t_k) * exp(-int_0^T nh(t) dt);
+    //   a lifetime   for the lineage born at t_k: unsampled extant with
+    //                probability (1-rho)e^{-mu r}/(1-rho e^{-mu r}), otherwise
+    //                exponential with rate mu_seg truncated to (0, r),
+    //                r = T - t_k;
+    //   a parent     uniformly over the labelled attachments, 2 per observed
+    //                lineage alive (including the two crown lineages) and 1 per
+    //                missing one: 2*tips + Ne of them (H5).
+    //
+    // The survival factor cancels against the lifetime's normalisation, which
+    // is why each event contributes log(N * lambda * mu) - mu * lifespan (extinct)
+    // or log(N * lambda * (1-rho)) - mu * (T - t) (unsampled extant).
+    //
+    // N, lambda_seg and mu_seg are the same numbers the sampler used, so the
+    // compensator is int nh dt exactly: on a segment nh is N*lambda_seg times a
+    // single exponential in t, whose integral is the closed form below for
+    // every link.
+    double sampling_prob(const param_t& pars, const tree_t& tree) const {
+      if (lineage_proposal()) return sampling_prob_ed(pars, tree);
+      double inte = 0;
+      double logg = 0;
+      double prev_brts = 0;
+      double tips = tree[0].n;
+      double Ne = 0.0;
+      const double T = tree.back().brts;
+
+      for (unsigned i = 0; i < tree.size(); ++i) {
+        const auto& node = tree[i];
+        double lambda = 0.0, mu = 0.0;
+        proposal_rates(pars, node, prev_brts, lambda, mu);
+        {
+          const double dt = node.brts - prev_brts;
+          const double int_segment = dt - rho_ * (1.0/mu) * (std::exp(-mu*(T - node.brts)) - std::exp(-mu*(T - prev_brts)));
+          inte += node.n * lambda * int_segment;
+        }
+        tips += is_tip(node);
+        Ne -= is_extinction(node);
+        if (is_missing(node)) {
+          // Augmented extinct species: logg = log(N*λ*μ) - μ*lifespan - log(K)
+          const double lifespan = node.t_ext - node.brts;
+          logg += std::log(node.n * mu * lambda) - mu * lifespan - std::log(2.0 * tips + Ne++);
+        }
+        else if (is_unsampled(node)) {
+          // Unsampled extant species (rho < 1): logg = log(N*λ*(1-ρ)) - μ*(T-t) - log(K)
+          logg += std::log(node.n * lambda * (1.0 - rho_)) - mu * (T - node.brts) - std::log(2.0 * tips + Ne++);
+        }
+
+        prev_brts = node.brts;
+      }
+      return logg - inte;
+    }
+
+    // Helper: integral of exp(a + b*t) from t1 to t2
+    // = exp(a) * [exp(b*t2) - exp(b*t1)] / b
+    // Handles b→0 limit: exp(a) * (t2 - t1)
+    static double exp_integral(double a, double b, double t1, double t2) {
+      if (std::abs(b) < 1e-12) return std::exp(a) * (t2 - t1);
+      return std::exp(a) * (std::exp(b * t2) - std::exp(b * t1)) / b;
+    }
+
+    // Helper: integral of intercept * exp(-(A + b*t - 1)^2 / 2) from t1 to t2
+    // where A = covariate sum excluding E, b = beta_E coefficient.
+    // Substituting u = (A + b*t - 1)/sqrt(2), dt = sqrt(2)/b du, gives
+    //   = intercept * sqrt(pi/2) / b * [erf(z2) - erf(z1)]
+    // where z_i = (A + b*t_i - 1) / sqrt(2).
+    // NOTE: divide by the SIGNED b, not |b|.  For b < 0 we have z2 < z1, so
+    // erf(z2) - erf(z1) < 0, and dividing by the negative b restores the
+    // correct positive integral (the integrand is strictly positive).  Using
+    // |b| would flip the sign of the hazard integral for negative beta_E.
+    // Handles b→0 limit: intercept * exp(-(A-1)^2/2) * (t2 - t1)
+    // Helper: integral of max(0, c + b*t) from t1 to t2 — one lineage's
+    // contribution to the compensator under the linear link, where the rate is
+    // a line clipped at zero.
+    //
+    // b == 0 leaves a constant rate max(0, c).  Otherwise f(t) = c + b*t has a
+    // single root at t* = -c/b and is positive on one side of it: above t* when
+    // b > 0, below it when b < 0.  The integral is the area of f over the part
+    // of [t1, t2] on that side, which is empty when t* lies past the far
+    // endpoint and the whole interval when it lies past the near one.  Over the
+    // surviving [lo, hi] the integrand is a line, so the exact area is its
+    // width times its value at the midpoint.
+    static double relu_integral(double c, double b, double t1, double t2) {
+      if (t2 <= t1) return 0.0;
+      if (b == 0.0) return std::max(0.0, c) * (t2 - t1);
+      const double root = -c / b;
+      const double lo = (b > 0.0) ? std::max(t1, root) : t1;
+      const double hi = (b > 0.0) ? t2 : std::min(t2, root);
+      if (hi <= lo) return 0.0;
+      return (hi - lo) * (c + b * (0.5 * (lo + hi)));
+    }
+
+    // log f(y, z | theta) when the ED covariate is active.
+    //
+    // The structure is loglik's below: event terms at the nodes, a compensator
+    // over each segment between events, and the sampling terms.  What ED adds
+    // is per-lineage: the rate of the lineage whose event a node is carries
+    // its ED at the event time, and the compensator sums over the alive
+    // lineages an integral whose argument is affine in t.  Per segment one
+    // pass over the lineage forest (ed_covariate.hpp) gives every alive
+    // lineage the constant c_s of ED_s(u) = c_s + (u - ts_s).  D is constant
+    // on the segment, as in loglik and in the simulator: between events every
+    // pendant age and their mean M grow at unit rate, so
+    // D_s = E_s(t2) - M(t2) = (t2 - ts^D_s) - M, with N and M the values the
+    // node at t2 carries (the event term at t2 reads the same D).  The
+    // per-lineage argument is
+    //
+    //   eta_s(u) = [beta_0 + beta_N N + (beta_M - beta_D) M + beta_D t2
+    //               - beta_D ts^D_s + beta_ED (c_s - ts_s)] + beta_ED u
+    //
+    // where ts^D_s is the pendant start the D terms read (the lineage's last
+    // split, or its birth) and ts_s the start segment_ed reports for ED, so
+    // that with beta_ED = 0 the two agree with the linear and exponential
+    // branches of loglik term by term.
+    // The linear link integrates the clipped line (relu_integral), the
+    // exponential link the exponential of it (exp_integral).
+    // Everything the ED likelihood needs from a tree and nothing it needs from
+    // the parameters: per segment i, over the alive lineages, the constant
+    // k_s = c_s - ts_s of the affine argument and the tip start ts^D_s the D
+    // terms read, packed as flat arrays (one entry per alive lineage, with
+    // the segment's offsets); per event node, the focal lineage's ED at the
+    // event time.  Built once per tree and cached (below), because the
+    // M-step evaluates the same trees at hundreds of parameter values.
+    struct ed_table_t {
+      std::vector<int>    seg_begin;   // size n_nodes + 1: offsets into the flat arrays
+      std::vector<double> kED;         // c_s - ts_s per alive lineage per segment
+      std::vector<double> tsD;         // the D branches' tip start per alive lineage per segment
+      std::vector<double> kK;          // K per alive lineage per segment (constant on it)
+      std::vector<double> focal;       // per node: ED of the event's lineage at the event time
+      std::vector<double> focalK;      // per node: K of the event's lineage
+      // Per segment, the sums and ranges of the per-lineage constants, for
+      // the closed form the linear link has when no lineage's rate is
+      // clipped on the segment (see loglik_ed).
+      std::vector<double> sum_kED, sum_tsD, min_kED, max_kED, min_tsD, max_tsD;
+      std::vector<double> sum_kK, min_kK, max_kK;
+      // For the ED-aware proposal's density: per alive lineage per segment
+      // its labelled attachments (2 observed, 1 augmented), and per augmented
+      // birth node the flat index of its parent's entry in the segment that
+      // ends at the node (-1 when the parent is not alive there).
+      std::vector<char>   w;
+      std::vector<int>    par_entry;
+      // Per alive lineage per segment, its index in the forest (loglik_marks
+      // collects each lineage's integrals through it).
+      std::vector<int>    lin;
+      std::size_t bytes() const {
+        return sizeof(double) * (kED.size() + tsD.size() + kK.size() + focal.size() + focalK.size()
+                                 + 9 * sum_kED.size())
+             + sizeof(int) * (seg_begin.size() + par_entry.size() + lin.size()) + w.size();
+      }
+    };
+
+    static void build_ed_table(const tree_t& tree, ed_table_t& tab) {
+      forest_t forest = build_forest(tree);
+      if (!forest.complete) {
+        throw std::invalid_argument(
+          "the ED covariate needs the tree's topology: pass a phylo object (or a "
+          "simulate_tree() result), not a bare branching-time vector");
+      }
+      std::vector<char> alive;
+      ed::result_t edr;
+      const std::size_t n_nodes = tree.size();
+      tab.seg_begin.assign(n_nodes + 1, 0);
+      tab.kED.clear(); tab.tsD.clear(); tab.kK.clear();
+      tab.focal.assign(n_nodes, 0.0); tab.focalK.assign(n_nodes, 0.0);
+      const double inf = std::numeric_limits<double>::infinity();
+      tab.sum_kED.assign(n_nodes, 0.0); tab.sum_tsD.assign(n_nodes, 0.0); tab.sum_kK.assign(n_nodes, 0.0);
+      tab.min_kED.assign(n_nodes, inf);  tab.max_kED.assign(n_nodes, -inf);
+      tab.min_tsD.assign(n_nodes, inf);  tab.max_tsD.assign(n_nodes, -inf);
+      tab.min_kK.assign(n_nodes, inf);   tab.max_kK.assign(n_nodes, -inf);
+      tab.w.clear();
+      tab.lin.clear();
+      tab.par_entry.assign(n_nodes, -1);
+      std::vector<int> entry_of(forest.parent.size(), -1);   // lineage -> its entry on this segment
+      const auto& splits = forest.splits;
+      double prev_brts = 0.0;
+      for (std::size_t i = 0; i < n_nodes; ++i) {
+        const auto& node = tree[i];
+        segment_ed(forest, prev_brts, node.brts, alive, edr);
+        // the compensator's per-lineage terms on this segment
+        for (std::size_t k = 0; k < alive.size(); ++k) {
+          if (!alive[k]) continue;
+          const int ni = forest.lineage_node[k];
+          const double kv = edr.c[k] - edr.ts[k];
+          // the D start restarts at the lineage's last split, as node.pd does
+          const double tv = pendant_start(splits, forest, k, prev_brts);
+          const double kk = lineage_k(splits, forest, k, prev_brts);
+          const bool observed = (ni < 0) || is_tip(tree[static_cast<std::size_t>(ni)]);
+          entry_of[k] = static_cast<int>(tab.kED.size());
+          tab.w.push_back(observed ? 2 : 1);
+          tab.lin.push_back(static_cast<int>(k));
+          tab.kED.push_back(kv);
+          tab.tsD.push_back(tv);
+          tab.kK.push_back(kk);
+          tab.sum_kED[i] += kv; tab.sum_tsD[i] += tv; tab.sum_kK[i] += kk;
+          tab.min_kED[i] = std::min(tab.min_kED[i], kv); tab.max_kED[i] = std::max(tab.max_kED[i], kv);
+          tab.min_tsD[i] = std::min(tab.min_tsD[i], tv); tab.max_tsD[i] = std::max(tab.max_tsD[i], tv);
+          tab.min_kK[i]  = std::min(tab.min_kK[i], kk);  tab.max_kK[i]  = std::max(tab.max_kK[i], kk);
+        }
+        tab.seg_begin[i + 1] = static_cast<int>(tab.kED.size());
+        // ED of the lineage whose event this is, at the event time: the
+        // splitting lineage of a birth, the dying lineage of an extinction.
+        // A birth with no lineage on record reads the mean ED of the alive
+        // lineages, which is Faith's PD over N -- the same marginalisation D
+        // makes when it reads M.
+        const double t = node.brts;
+        const int k = is_extinction(node) ? forest.node_lineage[i] : forest.lookup(node.parent_id);
+        if (k >= 0 && alive[static_cast<std::size_t>(k)]) {
+          tab.focal[i] = edr.c[static_cast<std::size_t>(k)] + (t - edr.ts[static_cast<std::size_t>(k)]);
+          tab.focalK[i] = lineage_k(splits, forest, static_cast<std::size_t>(k), prev_brts);
+          if (is_missing(node) || is_unsampled(node)) tab.par_entry[i] = entry_of[static_cast<std::size_t>(k)];
+        } else {
+          double s = 0.0, sk = 0.0; int m = 0;
+          for (std::size_t j = 0; j < alive.size(); ++j)
+            if (alive[j]) { s += edr.c[j] + (t - edr.ts[j]); sk += lineage_k(splits, forest, j, prev_brts); ++m; }
+          tab.focal[i] = m ? s / m : 0.0;
+          tab.focalK[i] = m ? sk / m : 0.0;
+        }
+        prev_brts = node.brts;
+      }
+    }
+
+    // A content fingerprint of a tree (FNV-1a over the fields the ED table
+    // depends on), so that a cached table is never read for a different
+    // tree that happens to occupy the same memory.
+    static uint64_t tree_fingerprint(const tree_t& tree) {
+      uint64_t h = 1469598103934665603ull;
+      auto mix = [&](uint64_t v) { h ^= v; h *= 1099511628211ull; };
+      auto mixd = [&](double d) { uint64_t v; std::memcpy(&v, &d, sizeof v); mix(v); };
+      mix(static_cast<uint64_t>(tree.size()));
+      for (const auto& node : tree) {
+        mixd(node.brts); mixd(node.t_ext); mixd(node.tip_start);
+        mix(static_cast<uint64_t>(static_cast<int64_t>(node.id)));
+        mix(static_cast<uint64_t>(static_cast<int64_t>(node.parent_id)));
+      }
+      return h;
+    }
+
+    // The table for a tree, from the cache or built and (budget permitting)
+    // cached.  The cache is per Model, shared by the M-step's threads under a
+    // mutex, and emptied when it exceeds its budget: the next M-step refills
+    // it with the trees then in use.
+    struct ed_cache_t {
+      std::mutex mutex;
+      std::unordered_map<uint64_t, std::shared_ptr<const ed_table_t>> map;
+      std::size_t bytes  = 0;
+      std::size_t budget = static_cast<std::size_t>(1) << 30;   // 1 GB per Model
+    };
+
+    std::shared_ptr<const ed_table_t> ed_table(const tree_t& tree) const {
+      const uint64_t fp = tree_fingerprint(tree);
+      ed_cache_t& cache = *ed_cache_;
+      {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        auto it = cache.map.find(fp);
+        if (it != cache.map.end()) return it->second;
+      }
+      auto tab = std::make_shared<ed_table_t>();
+      build_ed_table(tree, *tab);
+      const std::size_t b = tab->bytes();
+      std::lock_guard<std::mutex> lock(cache.mutex);
+      if (cache.bytes + b > cache.budget) { cache.map.clear(); cache.bytes = 0; }
+      if (b <= cache.budget) { cache.map[fp] = tab; cache.bytes += b; }
+      return tab;
+    }
+
+    double loglik_ed(const param_t& pars, const tree_t& tree) const {
+      const double bED = beta_ed(pars), gED = gamma_ed(pars);
+      const double bK = beta_k(pars), gK = gamma_k(pars);
+      const bool centred = ed_centred();
+      const std::shared_ptr<const ed_table_t> tab = ed_table(tree);
+
+      log_sum log_lambda{};
+      double log_mu_sum = 0.0;
+      double inte = 0.0;
+      double prev_brts = 0.0;
+      const std::size_t last = tree.size() - 1;
+
+      for (std::size_t i = 0; i < tree.size(); ++i) {
+        const auto& node = tree[i];
+        const double dt = node.brts - prev_brts;
+
+        // The segment's alive lineages, and the mean of their ED constants
+        // when the covariate is centred (0 otherwise, so the raw formulas
+        // below are unchanged).
+        const int p0 = tab->seg_begin[i], p1 = tab->seg_begin[i + 1];
+        const double n_al = static_cast<double>(p1 - p0);
+        const double cED = (centred && n_al > 0.0) ? tab->sum_kED[i] / n_al : 0.0;
+
+        if (dt > 0.0) {
+          const double N_seg = node.n;
+          const double M_seg = (N_seg > 0.0) ? node.pd / N_seg : 0.0;
+          // D_s = (t2 - tsD_s) - M is constant on the segment: its t2 goes into
+          // the base, and only a raw ED term carries a slope in u.
+          const double base_lam = pars[0] + pars[1] * N_seg + (pars[2] - pars[3]) * M_seg
+                                + pars[3] * node.brts;
+          const double base_mu  = pars[4] + pars[5] * N_seg + (pars[6] - pars[7]) * M_seg
+                                + pars[7] * node.brts;
+          const double b_lam = centred ? 0.0 : bED;
+          const double b_mu  = centred ? 0.0 : gED;
+          double seg = 0.0;
+          // Linear link, no clipping: every lineage's argument A_s + b u is
+          // positive at both ends of the segment (a line is monotone, so at
+          // both ends is everywhere), which the smallest A_s decides.  Then
+          // sum_s int max(0, A_s + b u) du = (sum_s A_s) dt + n b (t2^2 - t1^2)/2,
+          // O(1) from the segment's sums; the per-lineage loop is the
+          // fallback wherever clipping may occur.
+          auto min_A = [&](double base, double bD, double bE, double bk) {
+            return base
+              + (bD >= 0.0 ? -bD * tab->max_tsD[i] : -bD * tab->min_tsD[i])
+              + (bE >= 0.0 ?  bE * (tab->min_kED[i] - cED) :  bE * (tab->max_kED[i] - cED))
+              + (bk >= 0.0 ?  bk * tab->min_kK[i] : bk * tab->max_kK[i]);
+          };
+          auto sum_A = [&](double base, double bD, double bE, double bk) {
+            return n_al * base - bD * tab->sum_tsD[i] + bE * (tab->sum_kED[i] - n_al * cED)
+                 + bk * tab->sum_kK[i];
+          };
+          auto unclipped = [&](double base, double bD, double bE, double bk, double b) {
+            const double a = min_A(base, bD, bE, bk);
+            return n_al > 0.0 && a + b * prev_brts > 0.0 && a + b * node.brts > 0.0;
+          };
+          const double t1 = prev_brts, t2 = node.brts;
+          bool done_lam = false, done_mu = false;
+          if (link_ == LinkType::linear) {
+            if (unclipped(base_lam, pars[3], bED, bK, b_lam)) {
+              seg += sum_A(base_lam, pars[3], bED, bK) * (t2 - t1) + n_al * b_lam * 0.5 * (t2 * t2 - t1 * t1);
+              done_lam = true;
+            }
+            if (unclipped(base_mu, pars[7], gED, gK, b_mu)) {
+              seg += sum_A(base_mu, pars[7], gED, gK) * (t2 - t1) + n_al * b_mu * 0.5 * (t2 * t2 - t1 * t1);
+              done_mu = true;
+            }
+          }
+          if (!(done_lam && done_mu)) {
+            for (int p = p0; p < p1; ++p) {
+              const double kED = tab->kED[static_cast<std::size_t>(p)] - cED;
+              const double tsD = tab->tsD[static_cast<std::size_t>(p)];
+              const double kK  = tab->kK[static_cast<std::size_t>(p)];
+              const double A_lam = base_lam - pars[3] * tsD + bED * kED + bK * kK;
+              const double A_mu  = base_mu  - pars[7] * tsD + gED * kED + gK * kK;
+              if (link_ == LinkType::exponential) {
+                seg += exp_integral(A_lam, b_lam, t1, t2) + exp_integral(A_mu, b_mu, t1, t2);
+              } else {
+                if (!done_lam) seg += relu_integral(A_lam, b_lam, t1, t2);
+                if (!done_mu)  seg += relu_integral(A_mu,  b_mu,  t1, t2);
+              }
+            }
+          }
+          inte += seg;
+        }
+
+        // The event lineage's ED at the event; centred, its constant minus
+        // the segment mean (focal = k + t, and the mean at t is cED + t).
+        const double fED = centred ? tab->focal[i] - (cED + node.brts) : tab->focal[i];
+        const double fK  = tab->focalK[i];
+        if (is_extinction(node)) {
+          const double mu = extinction_rate_ep(pars, node, fED, fK);
+          log_mu_sum += std::log(std::max(mu, 1e-300));
+        }
+        else if (i != last) {
+          log_lambda += speciation_rate_ep(pars, node, fED, fK);
+        }
+        prev_brts = node.brts;
+      }
+
+      double log_sampling = 0.0;
+      if (rho_ < 1.0) {
+        int n_obs = 1;
+        int n_unsamp = 0;
+        for (const auto& node : tree) {
+          if (is_tip(node)) ++n_obs;
+          else if (is_unsampled(node)) ++n_unsamp;
+        }
+        log_sampling = n_obs * std::log(rho_) + n_unsamp * std::log(1.0 - rho_);
+      }
+      return log_mu_sum + log_lambda.result() - inte + log_sampling;
+    }
+
+    // Latent marks on a complete tree (dev/latent-marks/design.md).  The rate
+    // integrals and event rates are loglik_ed's, collected per lineage and per
+    // stretch between its splits (stretch j runs from its j-th split, or its
+    // birth, to the next or to its end); the marks multiply them.  The sum over
+    // mark histories is taken by pruning on the lineages of the forest, every
+    // daughter before its parent (a daughter's index is larger than its
+    // parent's), and the posterior of each stretch's mark by the downward pass.
+    struct marks_work_t {
+      forest_t f;
+      std::vector<std::vector<double>> Il, Im, ls;   // per lineage: integrals per stretch, log lambda per split
+      std::vector<double> ld;                        // per lineage: log mu at its death, NaN if none
+      std::vector<std::vector<int>> child;           // per lineage: its daughters, in split order
+      std::vector<double> Cb;                        // the symmetrised kernel (empty when P is used)
+      std::vector<double> clam, cmu;
+      double log_sampling = 0.0;
+    };
+
+    marks_work_t marks_prepare(const param_t& pars, const tree_t& tree, const marks_t& mk) const {
+      if (link_ != LinkType::exponential) {
+        throw std::invalid_argument("latent marks need the exponential link");
+      }
+      const int S = mk.S;
+      const std::size_t SS = static_cast<std::size_t>(S);
+      if (S < 1 || mk.log_clam.size() != SS || mk.log_cmu.size() != SS || mk.pi.size() != SS ||
+          (mk.P.empty() && mk.C.size() != SS * SS * SS) || (!mk.P.empty() && mk.P.size() != SS * SS)) {
+        throw std::invalid_argument("marks: log_clam, log_cmu, pi, C or P do not match S");
+      }
+      marks_work_t w;
+      w.f = build_forest(tree);
+      const forest_t& f = w.f;
+      if (!f.complete) {
+        throw std::invalid_argument("latent marks need the tree's topology");
+      }
+      const std::shared_ptr<const ed_table_t> tab = ed_table(tree);
+      const double bED = beta_ed(pars), gED = gamma_ed(pars);
+      const double bK = beta_k(pars), gK = gamma_k(pars);
+      const bool centred = ed_centred();
+      const std::size_t nL = f.parent.size();
+      w.Il.resize(nL); w.Im.resize(nL); w.ls.resize(nL); w.child.resize(nL);
+      w.ld.assign(nL, std::numeric_limits<double>::quiet_NaN());
+      for (std::size_t k = 0; k < nL; ++k) {
+        w.Il[k].assign(f.splits[k].size() + 1, 0.0);
+        w.Im[k].assign(f.splits[k].size() + 1, 0.0);
+        w.ls[k].assign(f.splits[k].size(), 0.0);
+        if (f.parent[k] >= 0) w.child[static_cast<std::size_t>(f.parent[k])].push_back(static_cast<int>(k));
+      }
+
+      double prev_brts = 0.0;
+      const std::size_t last = tree.size() - 1;
+      for (std::size_t i = 0; i < tree.size(); ++i) {
+        const auto& node = tree[i];
+        const int p0 = tab->seg_begin[i], p1 = tab->seg_begin[i + 1];
+        const double n_al = static_cast<double>(p1 - p0);
+        const double cED = (centred && n_al > 0.0) ? tab->sum_kED[i] / n_al : 0.0;
+        const double t1 = prev_brts, t2 = node.brts;
+        if (t2 > t1) {
+          const double N_seg = node.n;
+          const double M_seg = (N_seg > 0.0) ? node.pd / N_seg : 0.0;
+          const double base_lam = pars[0] + pars[1] * N_seg + (pars[2] - pars[3]) * M_seg + pars[3] * t2;
+          const double base_mu  = pars[4] + pars[5] * N_seg + (pars[6] - pars[7]) * M_seg + pars[7] * t2;
+          const double b_lam = centred ? 0.0 : bED;
+          const double b_mu  = centred ? 0.0 : gED;
+          for (int p = p0; p < p1; ++p) {
+            const std::size_t q = static_cast<std::size_t>(p);
+            const double kED = tab->kED[q] - cED;
+            const double A_lam = base_lam - pars[3] * tab->tsD[q] + bED * kED + bK * tab->kK[q];
+            const double A_mu  = base_mu  - pars[7] * tab->tsD[q] + gED * kED + gK * tab->kK[q];
+            const std::size_t k = static_cast<std::size_t>(tab->lin[q]);
+            const auto& sp = f.splits[k];
+            const std::size_t j = static_cast<std::size_t>(std::upper_bound(sp.begin(), sp.end(), t1) - sp.begin());
+            w.Il[k][j] += exp_integral(A_lam, b_lam, t1, t2);
+            w.Im[k][j] += exp_integral(A_mu, b_mu, t1, t2);
+          }
+        }
+        const double fED = centred ? tab->focal[i] - (cED + node.brts) : tab->focal[i];
+        const double fK  = tab->focalK[i];
+        if (is_extinction(node)) {
+          const int k = f.node_lineage[i];
+          if (k < 0) throw std::invalid_argument("latent marks: an extinction names no lineage");
+          w.ld[static_cast<std::size_t>(k)] = std::log(std::max(extinction_rate_ep(pars, node, fED, fK), 1e-300));
+        } else if (i != last) {
+          const int k = f.lookup(node.parent_id);
+          if (k < 0) throw std::invalid_argument("latent marks: a split names no lineage");
+          const auto& sp = f.splits[static_cast<std::size_t>(k)];
+          const std::size_t j = static_cast<std::size_t>(std::lower_bound(sp.begin(), sp.end(), node.brts) - sp.begin());
+          w.ls[static_cast<std::size_t>(k)][j] = std::log(std::max(speciation_rate_ep(pars, node, fED, fK), 1e-300));
+        }
+        prev_brts = node.brts;
+      }
+
+      if (mk.P.empty()) {
+        w.Cb.resize(SS * SS * SS);
+        for (std::size_t m = 0; m < SS; ++m)
+          for (std::size_t a = 0; a < SS; ++a)
+            for (std::size_t b = 0; b < SS; ++b)
+              w.Cb[(m * SS + a) * SS + b] = 0.5 * (mk.C[(m * SS + a) * SS + b] + mk.C[(m * SS + b) * SS + a]);
+      }
+      w.clam.resize(SS); w.cmu.resize(SS);
+      for (std::size_t m = 0; m < SS; ++m) { w.clam[m] = std::exp(mk.log_clam[m]); w.cmu[m] = std::exp(mk.log_cmu[m]); }
+      if (rho_ < 1.0) {
+        int n_obs = 1;
+        int n_unsamp = 0;
+        for (const auto& node : tree) {
+          if (is_tip(node)) ++n_obs;
+          else if (is_unsampled(node)) ++n_unsamp;
+        }
+        w.log_sampling = n_obs * std::log(rho_) + n_unsamp * std::log(1.0 - rho_);
+      }
+      return w;
+    }
+
+    // log sum_x wt[x] exp(v[x]), over the x with wt[x] > 0
+    static double marks_logdot(const double* wt, const double* v, std::size_t S) {
+      const double ninf = -std::numeric_limits<double>::infinity();
+      double mx = ninf;
+      for (std::size_t x = 0; x < S; ++x) if (wt[x] > 0.0 && v[x] > mx) mx = v[x];
+      if (mx == ninf) return ninf;
+      double s = 0.0;
+      for (std::size_t x = 0; x < S; ++x) if (wt[x] > 0.0) s += wt[x] * std::exp(v[x] - mx);
+      return mx + std::log(s);
+    }
+    static double marks_lse(const std::vector<double>& v) {
+      const double ninf = -std::numeric_limits<double>::infinity();
+      double mx = ninf;
+      for (double x : v) if (x > mx) mx = x;
+      if (mx == ninf) return ninf;
+      double s = 0.0;
+      for (double x : v) s += std::exp(x - mx);
+      return mx + std::log(s);
+    }
+    // The kernel weight of daughters (a, b) from parent mark m, on the log scale.
+    static double marks_logk(const marks_t& mk, const marks_work_t& w, std::size_t m, std::size_t a, std::size_t b) {
+      const std::size_t S = static_cast<std::size_t>(mk.S);
+      const double k = w.Cb.empty() ? mk.P[m * S + a] * mk.P[m * S + b] : w.Cb[(m * S + a) * S + b];
+      return k > 0.0 ? std::log(k) : -std::numeric_limits<double>::infinity();
+    }
+
+    // The upward pass.  A[k][j][m]: the log-likelihood of stretch j of lineage
+    // k and everything after it on k and its later daughters, given mark m on
+    // the stretch.  Returns the log-likelihood of the tree.
+    double marks_upward(const marks_t& mk, const marks_work_t& w,
+                        std::vector<std::vector<std::vector<double>>>* A) const {
+      const std::size_t SS = static_cast<std::size_t>(mk.S);
+      const forest_t& f = w.f;
+      const std::size_t nL = f.parent.size();
+      const bool indep = !mk.P.empty();
+      std::vector<double> tmp(SS), v(SS), nv(SS);
+      // log sum_{a,b} Cbar(m, a, b) exp(va[a] + vb[b])
+      auto split = [&](std::size_t m, const std::vector<double>& va, const std::vector<double>& vb) {
+        if (indep) {
+          const double* row = mk.P.data() + m * SS;
+          return marks_logdot(row, va.data(), SS) + marks_logdot(row, vb.data(), SS);
+        }
+        for (std::size_t a = 0; a < SS; ++a) tmp[a] = va[a] + marks_logdot(w.Cb.data() + (m * SS + a) * SS, vb.data(), SS);
+        return marks_lse(tmp);
+      };
+      std::vector<std::vector<double>> L(nL);
+      if (A) { A->assign(nL, {}); }
+      for (std::size_t k = nL; k-- > 0;) {
+        const std::size_t ns = f.splits[k].size();
+        if (A) (*A)[k].assign(ns + 1, std::vector<double>(SS));
+        for (std::size_t m = 0; m < SS; ++m) v[m] = std::isnan(w.ld[k]) ? 0.0 : w.ld[k] + mk.log_cmu[m];
+        for (std::size_t j = ns + 1; j-- > 0;) {
+          for (std::size_t m = 0; m < SS; ++m) v[m] -= w.clam[m] * w.Il[k][j] + w.cmu[m] * w.Im[k][j];
+          if (A) (*A)[k][j] = v;
+          if (j > 0) {
+            const std::size_t d = static_cast<std::size_t>(w.child[k][j - 1]);
+            for (std::size_t m = 0; m < SS; ++m) nv[m] = w.ls[k][j - 1] + mk.log_clam[m] + split(m, v, L[d]);
+            v = nv;
+          }
+        }
+        L[k] = v;
+      }
+      std::vector<double> root(SS, -std::numeric_limits<double>::infinity());
+      for (std::size_t m = 0; m < SS; ++m) if (mk.pi[m] > 0.0) root[m] = std::log(mk.pi[m]) + split(m, L[0], L[1]);
+      return marks_lse(root) + w.log_sampling;
+    }
+
+    // The log-likelihood of a complete tree with the latent marks summed out.
+    // With S = 1 this is loglik_ed.
+    double loglik_marks(const param_t& pars, const tree_t& tree, const marks_t& mk) const {
+      const marks_work_t w = marks_prepare(pars, tree, mk);
+      return marks_upward(mk, w, nullptr);
+    }
+
+    // The posterior of every stretch's mark given the complete tree: the
+    // upward pass, then the downward one.  B[k][j][m] is the log-probability of
+    // everything outside stretch j of lineage k and its later part, jointly
+    // with mark m there; B + A is the joint log-density of the tree and the
+    // mark, the same total on every stretch (the log-likelihood).
+    struct marks_posterior_t {
+      std::vector<int>    lineage, stretch, id;
+      std::vector<double> t_from, t_to;
+      std::vector<std::vector<double>> post;   // per row: the S posterior probabilities
+      double loglik = 0.0;
+    };
+    marks_posterior_t marks_posterior(const param_t& pars, const tree_t& tree, const marks_t& mk) const {
+      const marks_work_t w = marks_prepare(pars, tree, mk);
+      std::vector<std::vector<std::vector<double>>> A;
+      const double ll = marks_upward(mk, w, &A) - w.log_sampling;
+      const std::size_t SS = static_cast<std::size_t>(mk.S);
+      const forest_t& f = w.f;
+      const std::size_t nL = f.parent.size();
+      const double ninf = -std::numeric_limits<double>::infinity();
+      std::vector<std::vector<std::vector<double>>> B(nL);
+      for (std::size_t k = 0; k < nL; ++k) B[k].assign(A[k].size(), std::vector<double>(SS, ninf));
+      // own terms of a stretch, given its mark
+      auto own = [&](std::size_t k, std::size_t j, std::size_t m) {
+        return -(w.clam[m] * w.Il[k][j] + w.cmu[m] * w.Im[k][j]);
+      };
+      // the crowns: B of crown a's stretch 0 sums the root and crown b
+      for (std::size_t a = 0; a < SS; ++a) {
+        std::vector<double> ta, tb;
+        for (std::size_t r = 0; r < SS; ++r) {
+          if (!(mk.pi[r] > 0.0)) continue;
+          for (std::size_t b = 0; b < SS; ++b) {
+            ta.push_back(std::log(mk.pi[r]) + marks_logk(mk, w, r, a, b) + A[1][0][b]);
+            tb.push_back(std::log(mk.pi[r]) + marks_logk(mk, w, r, b, a) + A[0][0][b]);
+          }
+        }
+        B[0][0][a] = marks_lse(ta);
+        B[1][0][a] = marks_lse(tb);
+      }
+      // forward in lineage index: a parent's stretches before its daughters
+      for (std::size_t k = 0; k < nL; ++k) {
+        for (std::size_t j = 1; j < A[k].size(); ++j) {
+          const std::size_t d = static_cast<std::size_t>(w.child[k][j - 1]);
+          // the joint of (m on stretch j-1, a on stretch j, b on the daughter's stretch 0)
+          std::vector<double> pre(SS);
+          for (std::size_t m = 0; m < SS; ++m) pre[m] = B[k][j - 1][m] + own(k, j - 1, m) + w.ls[k][j - 1] + mk.log_clam[m];
+          for (std::size_t a = 0; a < SS; ++a) {
+            std::vector<double> tk, td;
+            for (std::size_t m = 0; m < SS; ++m)
+              for (std::size_t b = 0; b < SS; ++b) {
+                tk.push_back(pre[m] + marks_logk(mk, w, m, a, b) + A[d][0][b]);
+                td.push_back(pre[m] + marks_logk(mk, w, m, b, a) + A[k][j][b]);
+              }
+            B[k][j][a] = marks_lse(tk);
+            B[d][0][a] = marks_lse(td);
+          }
+        }
+      }
+      marks_posterior_t out;
+      out.loglik = ll + w.log_sampling;
+      const std::size_t last = tree.size() - 1;
+      for (std::size_t k = 0; k < nL; ++k) {
+        const int ni = f.lineage_node[k];
+        const int id = ni < 0 ? (k == 0 ? crown_id_a : crown_id_b) : tree[static_cast<std::size_t>(ni)].id;
+        const double end = std::isfinite(f.death[k]) ? f.death[k] : tree[last].brts;
+        for (std::size_t j = 0; j < A[k].size(); ++j) {
+          std::vector<double> lp(SS);
+          for (std::size_t m = 0; m < SS; ++m) lp[m] = A[k][j][m] + B[k][j][m];
+          const double z = marks_lse(lp);
+          std::vector<double> p(SS);
+          for (std::size_t m = 0; m < SS; ++m) p[m] = std::exp(lp[m] - z);
+          out.lineage.push_back(static_cast<int>(k)); out.stretch.push_back(static_cast<int>(j)); out.id.push_back(id);
+          out.t_from.push_back(j == 0 ? f.birth[k] : f.splits[k][j - 1]);
+          out.t_to.push_back(j < f.splits[k].size() ? f.splits[k][j] : end);
+          out.post.push_back(std::move(p));
+        }
+      }
+      return out;
+    }
+
+    // The ED-aware proposal on the segment ending at node i, from the table:
+    // the same numbers ed_proposal_segment gave the sampler, read off the
+    // finished tree (kED + t0 is ED_s(t0)).
+    void ed_proposal_segment_from_table(const param_t& pars, const tree_t& tree, std::size_t i,
+                                        const ed_table_t& tab, double t0,
+                                        ed_proposal_seg_t& seg, const forest_t* forest = nullptr) const {
+      const node_t& node = tree[i];
+      const double N = node.n;
+      const double M = (N > 0.0) ? pendant_pd(node, t0) / N : 0.0;
+      seg.t0 = t0; seg.t1 = node.brts; seg.T = tree.back().brts; seg.rho = rho_; seg.link = link_;
+      const bool centred = ed_centred();
+      seg.b = centred ? 0.0 : beta_ed(pars);
+      seg.clear();
+      const int p0 = tab.seg_begin[i], p1 = tab.seg_begin[i + 1];
+      const double cED = (centred && p1 > p0) ? tab.sum_kED[i] / static_cast<double>(p1 - p0) : 0.0;
+      double ed_sum = 0.0;
+      for (int p = p0; p < p1; ++p) {
+        const double ed0 = centred ? tab.kED[static_cast<std::size_t>(p)] - cED
+                                   : tab.kED[static_cast<std::size_t>(p)] + t0;
+        ed_sum += ed0;
+        const std::size_t kl = static_cast<std::size_t>(tab.lin[static_cast<std::size_t>(p)]);
+        seg.eta.push_back(proposal_eta_lambda(pars, N, M, ed0, tab.kK[static_cast<std::size_t>(p)])
+                          + (forest ? lineage_offset(*forest, tree, kl, t0) : 0.0));
+        seg.off_mu.push_back(forest ? lineage_offset(*forest, tree, kl, t0, true) : 0.0);
+        seg.w.push_back(tab.w[static_cast<std::size_t>(p)]);
+      }
+      const double n_al = static_cast<double>(p1 - p0);
+      const double ed_bar = (n_al > 0.0) ? ed_sum / n_al : 0.0;
+      const double k_bar  = (n_al > 0.0) ? tab.sum_kK[i] / n_al : 0.0;
+      seg.mu_bar = std::max(apply_link(proposal_eta_mu(pars, N, M, ed_bar, k_bar)), 1e-10);
+      seg.finish();
+    }
+
+    // log q(z | obs, theta) under the ED-aware proposal: per augmented birth
+    // at t on parent p, log Lambda(t) + the parent's mark + the lifetime term
+    // (the survival factor cancels against the lifetime's normalisation, as
+    // in sampling_prob), and the compensator int nh dt over every segment.
+    double sampling_prob_ed(const param_t& pars, const tree_t& tree) const {
+      const std::shared_ptr<const ed_table_t> tab = ed_table(tree);
+      const double neg_inf = -std::numeric_limits<double>::infinity();
+      ed_proposal_seg_t seg;
+      double inte = 0.0, logg = 0.0, prev_brts = 0.0;
+      const double T = tree.back().brts;
+      forest_t forest;
+      if (has_offsets()) forest = build_forest(tree);
+      for (std::size_t i = 0; i < tree.size(); ++i) {
+        const auto& node = tree[i];
+        ed_proposal_segment_from_table(pars, tree, i, *tab, prev_brts, seg, has_offsets() ? &forest : nullptr);
+        inte += seg.compensator();
+        if (is_missing(node) || is_unsampled(node)) {
+          const int pe = tab->par_entry[i];
+          if (pe < 0) return neg_inf;                     // no alive parent on record
+          const std::size_t k = static_cast<std::size_t>(pe - tab->seg_begin[i]);
+          const double t = node.brts;
+          const double Lam = seg.Lambda(t);
+          if (!(Lam > 0.0)) return neg_inf;
+          logg += std::log(Lam) + seg.log_mark(k, t);
+          if (has_offsets()) {
+            // The lifetime at the parent's rate mu_k: the survival factor of
+            // the birth intensity (at mu_bar) no longer cancels its
+            // normalisation 1 - rho exp(-mu_k (T - t)), so both are charged.
+            const double mk = seg.mu_bar * std::exp(seg.off_mu[k]);
+            logg += std::log(seg.survival(t)) - std::log(1.0 - rho_ * std::exp(-mk * (T - t)));
+            if (is_missing(node)) logg += std::log(mk) - mk * (node.t_ext - t);
+            else                  logg += std::log(1.0 - rho_) - mk * (T - t);
+          } else {
+            if (is_missing(node)) logg += std::log(seg.mu_bar) - seg.mu_bar * (node.t_ext - t);
+            else                  logg += std::log(1.0 - rho_) - seg.mu_bar * (T - t);
+          }
+        }
+        prev_brts = node.brts;
+      }
+      return logg - inte;
+    }
+
+    double loglik(const param_t& pars, const tree_t& tree) const {
+      if (lineage_loglik()) return loglik_ed(pars, tree);
+      const bool ep_exp = model_bin_[2] && (link_ == LinkType::exponential);
+      const bool ep_linear = model_bin_[2] && (link_ == LinkType::linear);
+
+      log_sum log_lambda{};
+      double log_mu_sum = 0.0;
+      double inte = 0.0;
+      double prev_brts = 0.0;
+
+      // The alive lineages and their pendant starts: the set the D
+      // compensator integrates over.  It replays, lineage by lineage, the
+      // forward sweep that built the tree (pendant_sweep in
+      // src/augment_tree.cpp), so that every lineage's start is the one the
+      // event terms read through focal_tip_start and tip_start: two crown
+      // lineages at 0; a split resets the splitting lineage's start to the
+      // event time and adds the daughter there; an extinction removes the
+      // dying lineage.  Which lineage splits or dies is resolved as the sweep
+      // resolved it:
+      //
+      //   a split naming its parent (parent_id)  that lineage, by id; none if
+      //       it is not alive, as in the sweep;
+      //   a split naming no parent               the lineage whose start is
+      //       its focal_tip_start (an observed lineage under the topology
+      //       convention), which is the start the sweep found it at or the one
+      //       a tree assembled in R records;
+      //   ... and recording ts_unknown           nothing under the legacy
+      //       convention (a bare branching-time vector: every observed
+      //       lineage dates from the crown and the sweep's reset map is not
+      //       touched by an observed split); under the topology convention
+      //       the observed lineage the topology dates nearest the crown;
+      //   an extinction                           the lineage with its id;
+      //       the start it records when it has none (a tree assembled in R).
+      //
+      // Ties go to the first-born lineage, as in the sweep, which holds its
+      // lineages in the same birth order.  The set is node.n lineages on every
+      // segment, which is what makes the compensator collapse onto
+      // dt * n * (lambda + mu) when beta_D = gamma_D = 0.
+      struct alive_t { int id; double ts; double obs_ts; bool observed; };
+      std::vector<alive_t> alive;
+      const bool topology = !tree.empty() && tree.back().clade == clade_topology;
+      if (model_bin_[2]) {
+        alive.reserve(tree.size() + 2);
+        alive.push_back({crown_id_a, 0.0, 0.0, true});
+        alive.push_back({crown_id_b, 0.0, 0.0, true});
+      }
+      // The lineage with this id; when several share it (hand-built trees give
+      // every row the same id), the one whose start is nearest `ts`.
+      auto alive_by_id = [&alive](int id, double ts) {
+        auto best = alive.end();
+        if (id == no_parent) return best;
+        for (auto it = alive.begin(); it != alive.end(); ++it) {
+          if (it->id != id) continue;
+          if (best == alive.end() || std::abs(it->ts - ts) < std::abs(best->ts - ts)) best = it;
+        }
+        return best;
+      };
+      // The first-born entry whose start (or, with `obs`, whose start on the
+      // observed tree) is nearest `ts`, optionally among observed lineages only.
+      auto alive_nearest = [&alive](double ts, bool observed_only, bool obs) {
+        auto best = alive.end();
+        double best_d = 0.0;
+        for (auto it = alive.begin(); it != alive.end(); ++it) {
+          if (observed_only && !it->observed) continue;
+          const double d = std::abs((obs ? it->obs_ts : it->ts) - ts);
+          if (best == alive.end() || d < best_d) { best = it; best_d = d; }
+        }
+        return best;
+      };
+
+      for (unsigned i = 0; i < tree.size(); ++i) {
+        const auto& node = tree[i];
+        const double dt = node.brts - prev_brts;
+
+        if ((ep_exp || ep_linear) && dt > 0.0) {
+          // Orthogonal basis {N, M=P/N, D=E-M}.  Between events every alive
+          // lineage's pendant age E_s(u) = u - ts_s and their mean M(u) grow at
+          // unit rate, so each D_s(u) = E_s(u) - M(u) = tsbar - ts_s is constant
+          // on the segment (tsbar the mean pendant start of the alive set).  It
+          // is read at the segment's end, D_s = (t2 - ts_s) - M, with N and
+          // M = node.pd / node.n the values the node at t2 carries; that is
+          // also the D the event term at t2 reads (speciation_rate_ep) and the
+          // value the forward simulator holds between events
+          // (inst/include/general_tree.hpp).  Every rate is then constant on
+          // the segment and the compensator is dt times the sum of the alive
+          // lineages' rates, under every link.  The alive set is `alive`
+          // above: node.n lineages, which is what makes the branch collapse
+          // onto dt*n*(lambda+mu) when beta_D and gamma_D are zero.
+          const double N_seg = node.n;
+          const double M_seg = (N_seg > 0.0) ? node.pd / N_seg : 0.0;
+          double seg = 0.0;
+          if (ep_exp) {
+            // Sum_s exp(A + beta_D ((t2 - ts_s) - M))
+            //   = exp(A + beta_D (t2 - M)) * Sum_s exp(-beta_D ts_s)
+            const double A_lam = pars[0] + pars[1]*N_seg + pars[2]*M_seg + pars[3]*(node.brts - M_seg);
+            const double A_mu  = pars[4] + pars[5]*N_seg + pars[6]*M_seg + pars[7]*(node.brts - M_seg);
+            double sum_exp_bE = 0.0, sum_exp_gE = 0.0;   // Sum_s exp(-beta_D ts_s), Sum_s exp(-gamma_D ts_s)
+            for (const auto& l : alive) {
+              sum_exp_bE += std::exp(-pars[3] * l.ts);
+              sum_exp_gE += std::exp(-pars[7] * l.ts);
+            }
+            seg = std::exp(A_lam) * sum_exp_bE + std::exp(A_mu) * sum_exp_gE;
+          } else {
+            for (const auto& l : alive) {
+              const double D = (node.brts - l.ts) - M_seg;
+              seg += std::max(0.0, pars[0] + pars[1]*N_seg + pars[2]*M_seg + pars[3]*D);
+              seg += std::max(0.0, pars[4] + pars[5]*N_seg + pars[6]*M_seg + pars[7]*D);
+            }
+          }
+          inte += dt * seg;
+        } else {
+          // Standard: piecewise constant rates
+          const double lambda = model_bin_[2] ? speciation_rate_ep(pars, node)
+                                              : speciation_rate(pars, node);
+          const double mu     = model_bin_[2] ? extinction_rate_ep(pars, node)
+                                              : extinction_rate(pars, node);
+          inte += dt * node.n * (lambda + mu);
+        }
+
+        // Event contributions (speciation / extinction log-probabilities)
+        const double lambda = model_bin_[2] ? speciation_rate_ep(pars, node)
+                                            : speciation_rate(pars, node);
+        const double mu     = model_bin_[2] ? extinction_rate_ep(pars, node)
+                                            : extinction_rate(pars, node);
+
+        if (is_extinction(node)) {
+          log_mu_sum += std::log(std::max(mu, 1e-300));
+        }
+        else if (i != tree.size() - 1) {
+          log_lambda += lambda;
+        }
+
+        // The alive set after this node's event
+        if (model_bin_[2]) {
+          if (is_extinction(node)) {
+            auto it = alive_by_id(node.id, node.tip_start);
+            if (it == alive.end()) it = alive_nearest(node.tip_start, false, false);
+            if (it != alive.end()) alive.erase(it);
+          } else if (i != tree.size() - 1) {
+            const bool observed = is_tip(node);
+            auto it = alive.end();
+            if (has_parent(node.parent_id)) {
+              it = alive_by_id(node.parent_id, node.focal_tip_start);
+            } else if (node.focal_tip_start >= 0.0) {
+              it = alive_nearest(node.focal_tip_start, topology, false);
+            } else if (topology && observed) {
+              it = alive_nearest(0.0, true, true);
+            }
+            if (it != alive.end()) {
+              it->ts = node.brts;                      // the splitting lineage, a tip again
+              if (observed) it->obs_ts = node.brts;
+            }
+            alive.push_back({node.id, node.brts, node.brts, observed});   // the daughter
+          }
+        }
+
+        prev_brts = node.brts;
+      }
+      // Sampling terms for incomplete taxon sampling (rho < 1)
+      // Each observed tip contributes log(rho), each unsampled extant contributes log(1-rho)
+      double log_sampling = 0.0;
+      if (rho_ < 1.0) {
+        int n_obs = 1;  // start at 1: crown-age tree has n tips but only n-1 is_tip events
+        int n_unsamp = 0;
+        for (const auto& node : tree) {
+          if (is_tip(node)) ++n_obs;
+          else if (is_unsampled(node)) ++n_unsamp;
+        }
+        log_sampling = n_obs * std::log(rho_) + n_unsamp * std::log(1.0 - rho_);
+      }
+
+      const double loglik = log_mu_sum + log_lambda.result() - inte + log_sampling;
+      return loglik;
+    }
+
+    param_t lower_bound() const { return lower_bound_; }
+    param_t upper_bound() const { return upper_bound_; }
+    double rho() const { return rho_; }
+  private:
+    param_t lower_bound_;
+    param_t upper_bound_;
+    std::vector<int> model_bin_ = {0, 0, 0, 0};
+    // The ED tables of the trees a Model has scored, shared by every copy of
+    // the Model and by the M-step's threads (see ed_table()).
+    std::shared_ptr<ed_cache_t> ed_cache_ = std::make_shared<ed_cache_t>();
+    std::shared_ptr<const std::unordered_map<int, std::vector<offset_piece_t>>> offsets_;
+    LinkType link_ = LinkType::linear;
+    double rho_ = 1.0;
+  };
+}
+
+#endif

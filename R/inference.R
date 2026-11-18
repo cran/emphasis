@@ -1,0 +1,1975 @@
+#' Prune extinct tips from a phylogenetic tree
+#'
+#' Drops tips that did not survive to the present (i.e. tips whose root-to-tip
+#' distance is shorter than the maximum, within a small numerical tolerance).
+#'
+#' @param phy A \code{phylo} object, possibly containing extinct lineages.
+#' @param tol Tolerance for deciding whether a tip is at the present.
+#'   Default \code{1e-8}.
+#' @return A \code{phylo} object with only extant tips retained.
+#' @keywords internal
+prune_to_extant <- function(phy, tol = 1e-8) {
+  if (!inherits(phy, "phylo")) stop("'phy' must be a phylo object.")
+  heights  <- ape::node.depth.edgelength(phy)
+  tip_h    <- heights[seq_len(ape::Ntip(phy))]
+  extinct  <- which(abs(tip_h - max(tip_h)) > tol)
+  if (length(extinct) > 0) phy <- ape::drop.tip(phy, phy$tip.label[extinct])
+  phy
+}
+
+#' Default control parameters for estimate_rates
+#'
+#' Returns a list of default tuning parameters for \code{\link{estimate_rates}}.
+#' Override individual elements and pass the modified list via the
+#' \code{control} argument.
+#'
+#' @param method Which method's defaults to return: \code{"mcem"},
+#'   \code{"cem"}, or \code{"gam"}.
+#' @param n_pars Number of parameters (used to set the default \code{sd_vec}
+#'   for CEM when \code{NULL}).
+#' @return A named list of control parameters.
+#'
+#' Shared parameters (both methods):
+#' \describe{
+#'   \item{\code{lower_bound}}{Numeric vector of lower parameter bounds.
+#'     Length must be \code{2 + 2*sum(model)}. \strong{Required} (no default).}
+#'   \item{\code{upper_bound}}{Numeric vector of upper parameter bounds
+#'     (same order). \strong{Required} (no default).}
+#'   \item{\code{verbose}}{Print progress messages. Default \code{FALSE}.}
+#'   \item{\code{max_missing}}{Max extinct lineages per augmented tree.
+#'     Trees that require more than this many extinct lineages are discarded.
+#'     Default \code{1e4}.}
+#'   \item{\code{num_threads}}{Threads for parallel computation. Default
+#'     \code{1}.}
+#'   \item{\code{rho}}{Sampling fraction: the proportion of extant species
+#'     present in the tree, in \code{(0, 1]}. Default \code{1} (complete
+#'     sampling). Values outside \code{(0, 1]} are an error. Under
+#'     \code{rho < 1} the augmentation inserts unsampled extant lineages as
+#'     well as extinct ones; both samplers do so, and the choice of sampler
+#'     does not depend on \code{rho}.}
+#'   \item{\code{max_time}}{Wall-clock budget of the fit in seconds; \code{NULL}
+#'     disables it. Default \code{3600}. Under \code{"mcem"} the clock binds
+#'     inside the E-step and the M-step, and the fit ends with
+#'     \code{stop_reason = "time_budget"} and a \code{clock} note naming the
+#'     step it cut. Both samplers stop drawing when it runs out, inside a draw
+#'     as well as between draws, and the iteration in progress is discarded.
+#'     The M-step's optimiser reads it before every evaluation of its
+#'     objective; cut short, the iteration keeps the best point the optimiser
+#'     had evaluated when that point improves on the current iterate, and is
+#'     discarded otherwise. The E-step that evaluates the returned parameters
+#'     then gets \code{max_time} again, and when it runs out its
+#'     log-likelihood rests on the draws it made, so an MCEM fit returns
+#'     within about twice \code{max_time}. Under \code{"cem"} and
+#'     \code{"gam"} the clock is read between evaluations.}
+#' }
+#'
+#' MCEM-specific parameters:
+#' \describe{
+#'   \item{\code{sampling}}{Sampling scheme: \code{"bdi"} (default), the
+#'     birth-death-with-immigration sampler, which covers the cr and dd models
+#'     on the linear and exponential links, at any
+#'     \code{rho} in \code{(0, 1]}; or \code{"dynamic_fresh"}, the thinning
+#'     sampler, which covers every model, link and \code{rho}. Under constant
+#'     rates the BDI proposal is the exact conditional distribution, so its
+#'     weights are constant and its effective sample size is the number of
+#'     draws; under diversity dependence and under ED it is a mean-field
+#'     approximation and the weights vary. \code{"bdi"} falls back to
+#'     \code{"dynamic_fresh"}, with a message naming the reason, for a D- or
+#'     M-dependent model.}
+#'   \item{\code{damping}}{BDI only: under-relaxation of the mean-field sweep,
+#'     which is a Picard iteration \eqn{x \leftarrow F(x)}. Where its map
+#'     expands the iteration diverges and a larger budget makes it worse: on a
+#'     416-tip tree at rates whose equilibrium is critical the residual is 305
+#'     after 20 sweeps and 329 after 200. A partial step,
+#'     \eqn{x \leftarrow (1-\omega)x + \omega F(x)}, contracts it.
+#'     \code{"auto"} starts at \eqn{\omega = 1} and halves it
+#'     whenever the residual grows; on that tree it converges in 40 sweeps, and
+#'     where the map already contracts it is the plain iteration to the bit.
+#'     A number in \eqn{(0, 1]} fixes \eqn{\omega} instead; \code{1} is the
+#'     plain iteration. \code{"default"} (the default) is \code{"auto"} at
+#'     \code{rho = 1} and \eqn{\omega = 1/8} at \code{rho < 1}: in
+#'     experiment E10c a fixed 1/8 converged 0 of 192 units within the 20
+#'     sweeps at \code{rho = 1} against 131 for \code{"auto"}, at 1.4--3.3
+#'     times the E-step time and no gain in effective sample, and below
+#'     \code{rho = 1} it converged more (142 against 131 at \code{rho = 0.2});
+#'     an explicit \code{"auto"} or number is used as given. Relaxation below about \eqn{1/20} converges too slowly
+#'     to be useful. It fixes the iteration and nothing else: at 416 tips the
+#'     effective sample is 2.1 of 97 even with a converged mean field, because
+#'     the proposal must invent some 600 missing lineages there (audit H108).
+#'     Every E-step's mean field is in the trace (\code{mf_converged},
+#'     \code{mf_delta}, the final residual, \code{mf_sweeps},
+#'     \code{mf_omega}, the relaxation of the last sweep, and
+#'     \code{mf_budget}); when some E-step relaxed the iteration below the
+#'     full step or did not converge within its sweep budget, or the setting
+#'     is not \code{"auto"}, the fit's \code{notes} carry a
+#'     \code{mean_field} entry with the resolved setting (and whether it is
+#'     the default for the fit's \code{rho}), the sweeps, relaxation and
+#'     residual of the last E-step and whether it converged, and
+#'     \code{print()} shows it.}
+#'   \item{\code{mesh}}{BDI only, and only where its Gillespie branch runs
+#'     (any model but \code{"cr"}): the number of steps per crown age the
+#'     frozen rates are re-evaluated on. \code{NULL} (default) leaves the
+#'     step uncapped, which is a rate held over a whole waiting time. A mesh
+#'     tightens the weights --- on a 60-tip dd tree the standard deviation of
+#'     the log-weight falls from 0.465 to 0.061 at 2000 steps per crown age,
+#'     and the effective sample from 600 draws rises from 527 to 598 --- and
+#'     does not move the estimate (\code{dev/mfc_mesh.R}).}
+#'   \item{\code{proposal}}{The thinning sampler's proposal for an ED model
+#'     (\code{"ed"}, \code{"ned"}, \code{~ ED}): \code{"ed"} (default) draws
+#'     the missing births at the model's total speciation rate over the alive
+#'     lineages, each at its own ED, and attaches a birth to a lineage in
+#'     proportion to that lineage's rate; \code{"meanfield"} draws them at
+#'     \code{N * lambda(N, M)} with the ED term at zero and attaches uniformly,
+#'     as for every other model. The two are the same proposal at
+#'     \code{beta_ED = gamma_ED = 0}. Ignored for a model without ED.}
+#'   \item{\code{num_trees}}{Augmented trees per EM iteration. Default
+#'     \code{200}. Alias: \code{sample_size}.}
+#'   \item{\code{xtol}}{Relative tolerance for the M-step optimiser.
+#'     Default \code{1e-3}.}
+#'   \item{\code{max_iter}}{Maximum EM iterations. Default \code{200}.}
+#'   \item{\code{maxN}}{Total augmentation attempts per E-step (accepted
+#'     plus rejected). Read by the thinning sampler only; the BDI sampler
+#'     has no such cap and ignores it. Under \code{"dynamic_fresh"} it must
+#'     be at least \code{num_trees}, and \code{estimate_rates} stops with an
+#'     error otherwise. Increase for models with high rejection rates (e.g.
+#'     D/DD with strongly negative covariate slope). Default \code{NULL},
+#'     and a non-finite value is treated as \code{NULL}, which sets
+#'     \code{max(2000, 10 * num_trees)}.}
+#'   \item{\code{tol}}{Parameter-stability convergence threshold. MCEM
+#'     is considered converged when the largest relative parameter change,
+#'     \eqn{\max_j |\theta_k[j] - \theta_{k-1}[j]| / \max(|\theta_{k-1}[j]|, c)},
+#'     is below \code{tol} for \code{patience} consecutive iterations. The
+#'     bound box does not enter. The floor \eqn{c} carries the units of the
+#'     parameters (see \code{.rel_floor}): \code{tol / crown_age} where
+#'     they are rates (linear link) and \code{tol} where they
+#'     are log-rates (exponential link), so the statistic does not change
+#'     when the tree is expressed in another unit of time. Default
+#'     \code{1e-2}: every coordinate must move by less than 1\% of its own
+#'     magnitude, \code{patience} times in a row. The step the sampler
+#'     itself produces sets whether that is reachable -- on a 12-tip CR tree
+#'     at \code{num_trees = 200} the statistic has median 0.02 and falls
+#'     below \code{1e-2} in about a fifth of iterations -- so runs at these
+#'     defaults commonly end at \code{max_iter}. Raising \code{num_trees}
+#'     shrinks the Monte Carlo part of the step.}
+#'   \item{\code{patience}}{Number of consecutive iterations with parameter
+#'     change below \code{tol} required to declare convergence. Default
+#'     \code{3}.}
+#' }
+#'
+#' Read only under \code{estimate_rates(cond = "surface")}, and not in the
+#' list this function returns (the default is used when an entry is absent):
+#' \describe{
+#'   \item{\code{surface_radius}}{Half-width of a surface's box, as a share of
+#'     the fit's box per coordinate. Default \code{0.03}.}
+#'   \item{\code{surface_se}}{Standard error of \eqn{\log P(S)} at a surface's
+#'     centre that its clade count is set for. Default \code{0.02}.}
+#'   \item{\code{surface_final_se}}{Standard error of the direct
+#'     \eqn{\log P(S)} at the estimate that the reported log-likelihood
+#'     subtracts. Default \code{0.01}.}
+#'   \item{\code{surface_segment}}{MCEM iterations per segment of the
+#'     conditioned continuation. Default \code{25}.}
+#'   \item{\code{surface_max_lin}}{Lineage cap of a simulated clade; a clade
+#'     that passes it counts as surviving. Default \code{NULL}, which is
+#'     \code{max(1000, 20 * n_tips)}.}
+#'   \item{\code{surface_edge}}{The unconditioned \code{gamma_0} within this
+#'     share of the box span of an edge triggers the run from the nested start.
+#'     Default \code{1e-3}.}
+#'   \item{\code{surface_restart}}{Whether that run is made. Default
+#'     \code{TRUE}.}
+#'   \item{\code{surface_max_clades}}{Cap on the clades per surface point.
+#'     Default \code{40000}.}
+#'   \item{\code{surface_final_max_clades}}{Cap on the clades of the direct
+#'     estimate at the estimate. Default \code{1e5}.}
+#'   \item{\code{surface_seed}}{Seed of the simulated clades, or \code{NULL}
+#'     (default) to draw one from R's generator, so that \code{set.seed()}
+#'     reproduces them.}
+#' }
+#'
+#' CEM-specific parameters:
+#' \describe{
+#'   \item{\code{max_iter}}{Maximum CEM iterations (hard cap). Default \code{20}.}
+#'   \item{\code{num_particles}}{Particle population size (parameter vectors
+#'     per iteration). Default \code{50}. Alias: \code{num_points}.}
+#'   \item{\code{sd_vec}}{Initial perturbation SDs. \code{NULL} (default)
+#'     sets each to \code{(upper - lower) / 4} at call time.}
+#'   \item{\code{maxN}}{Max augmentation attempts per particle evaluation.
+#'     Default \code{10}.}
+#'   \item{\code{num_trees}}{Augmented trees simulated per particle per
+#'     iteration. Default \code{1}. Alias: \code{sample_size}.}
+#'   \item{\code{shared_trees}}{If \code{FALSE} (default), each particle is
+#'     evaluated on its own simulated trees.  If \code{TRUE}, trees are pooled
+#'     across all particles and every particle's \code{fhat} is re-evaluated
+#'     over the full pool (lower variance; bias correction not yet implemented).}
+#'   \item{\code{disc_prop}}{Elite fraction retained per iteration (Cross-Entropy
+#'     Method). Default \code{0.5}.}
+#'   \item{\code{bias_correct}}{Apply moment-based bias correction to the IS
+#'     log-likelihood. Default \code{FALSE}.}
+#'   \item{\code{num_trees}}{When \code{> 1}, bootstrap variance of the
+#'     log-likelihood is computed automatically (B = 200 replicates) from
+#'     the IS weights already drawn.  Minimum recommendation: \code{5}.
+#'     \code{loglik_var} in the fit is \code{NA} when \code{num_trees = 1}.}
+#' }
+#' @keywords internal
+estimate_rates_control <- function(method = c("mcem", "cem", "gam"), n_pars = 4) {
+  method <- match.arg(method)
+  common <- list(
+    lower_bound = NULL,
+    upper_bound = NULL,
+    verbose     = FALSE,
+    max_missing = 1e4,
+    num_threads = 1L,
+    max_time    = 3600,   # seconds; NULL disables
+    rho         = 1.0     # sampling fraction (1 = complete sampling)
+  )
+  if (method == "mcem") {
+    c(common, list(
+      sampling    = "bdi",      # BDI exact sampler (default); "dynamic_fresh" for thinning
+      proposal    = "ed",       # thinning proposal for an ED model: "ed" or "meanfield"
+      stop_rule   = "rel_change", # "rel_change" or "mc_error" (Monte Carlo error aware)
+      mc_batches  = 5L,         # mc_error: batches the Monte Carlo error is estimated from
+      mc_z        = 1.0,        # mc_error: a step below this many standard errors is noise
+      mc_grow     = 1.5,        # mc_error: factor the draws grow by when a step is noise
+      mesh        = NULL,       # bdi: steps per crown age the frozen Gillespie rates are
+                                #   re-evaluated on; NULL leaves the step uncapped
+      damping     = "default",  # bdi: under-relaxation of the mean-field sweep;
+                                #   "default" ("auto" at rho = 1, 1/8 below),
+                                #   "auto", or a number in (0, 1]
+      max_draws   = NULL,       # mc_error: cap on the grown draws; NULL -> 8 * num_trees
+      sample_size = 200L,       # alias: num_trees
+      max_iter    = 200L,
+      maxN        = NULL,       # total augmentation attempts (thinning only); NULL -> max(2000, 10 * sample_size)
+      xtol        = 1e-3,
+      tol         = 1e-2,
+      patience    = 3L
+    ))
+  } else if (method == "cem") {
+    c(common, list(
+      max_iter     = 50L,       # safety cap (adaptive SD stops earlier)
+      num_particles = 50L,      # alias: num_points
+      sd_vec       = NULL,
+      maxN         = 10L,
+      num_trees    = 1L,        # alias: sample_size
+      shared_trees = FALSE,
+      disc_prop    = 0.5,
+      tol          = 1e-4,
+      patience     = 5L,
+      sd_decay     = 0.85,      # adaptive SD decay factor
+      sd_min_frac  = 0.01,      # SD floor as fraction of initial
+      bias_correct = FALSE
+    ))
+  } else {
+    # GAM method
+    c(common, list(
+      grid_points  = 20L,       # per-parameter grid resolution
+      sample_size  = 200L,      # IS trees per grid point
+      maxN         = NULL,      # auto-set from sample_size
+      max_lambda   = 500,
+      spline_type  = "univariate"
+    ))
+  }
+}
+
+# --------------------------------------------------------------------------- #
+#  Time budget helper                                                          #
+# --------------------------------------------------------------------------- #
+
+#' @keywords internal
+.check_time_budget <- function(t_start, i, n_total, max_time,
+                                warmup = 3L, label = "unit") {
+  if (is.null(max_time) || i < warmup) return(invisible(NULL))
+  elapsed   <- proc.time()[3] - t_start
+  rate      <- elapsed / i
+  projected <- rate * n_total
+  if (projected > max_time) {
+    stop(sprintf(
+      paste0("Time budget exceeded: completed %d/%d %ss in %.1fs (%.2fs each); ",
+             "projected total %.0fs exceeds max_time=%ds.\n",
+             "  Increase max_time in control, or set max_time=NULL to disable."),
+      i, n_total, label, elapsed, rate, projected, as.integer(max_time)),
+      call. = FALSE)
+  }
+  invisible(NULL)
+}
+
+# --------------------------------------------------------------------------- #
+#  Sampling fraction                                                           #
+# --------------------------------------------------------------------------- #
+
+#' Validate a sampling fraction
+#'
+#' \code{rho} is the fraction of extant species present in the tree, so it
+#' lives in \code{(0, 1]}.  The C++ layer (\code{model.hpp}) replaces any
+#' value outside that range by 1 and reports nothing, so a call made with
+#' \code{rho = 80} or \code{rho = -1} returns a complete-sampling fit under
+#' the label the user asked for (audit finding H79).  Every R entry point
+#' that accepts \code{rho} checks it here first.
+#'
+#' @param rho The value supplied by the caller.
+#' @param arg Name to quote in the error message.
+#' @return \code{rho} as a length-1 double.
+#' @keywords internal
+.check_rho <- function(rho, arg = "control$rho") {
+  ok <- is.numeric(rho) && length(rho) == 1L && is.finite(rho) &&
+    rho > 0 && rho <= 1
+  if (!ok) {
+    got <- if (is.null(rho)) "NULL" else
+      paste(utils::head(format(rho), 3L), collapse = ", ")
+    stop(sprintf(paste0(
+      "%s must be a single number in (0, 1] (got %s). It is the fraction of ",
+      "extant species present in the tree: rho = 1 is complete sampling, ",
+      "rho = 0.5 means half the extant species are missing."), arg, got),
+      call. = FALSE)
+  }
+  as.numeric(rho)
+}
+
+# --------------------------------------------------------------------------- #
+#  Internal helpers                                                            #
+# --------------------------------------------------------------------------- #
+
+#' Resolve control-parameter aliases
+#'
+#' Supports both old names (\code{num_points}, \code{sample_size}) and new
+#' names (\code{num_particles}, \code{num_trees}).  User-supplied values take
+#' precedence; if both old and new are present, the new name wins.
+#' Internally the code always reads the OLD names for backwards compatibility
+#' with \code{emphasis_cem} and the C++ layer.
+#' @keywords internal
+.resolve_control_aliases <- function(ctrl, method, user_ctrl = list()) {
+  # Sync alias pairs.  If the user explicitly supplied an old name, it
+
+  # overrides the default new name (and vice-versa).  When both old and
+  # new names come from defaults only, the new name is authoritative.
+  .sync <- function(ctrl, new_nm, old_nm, user_ctrl) {
+    user_new <- !is.null(user_ctrl[[new_nm]])
+    user_old <- !is.null(user_ctrl[[old_nm]])
+    if (user_old && !user_new) {
+      # User supplied old name only -> propagate to new
+      ctrl[[new_nm]] <- ctrl[[old_nm]]
+    } else if (user_new && !user_old) {
+      # User supplied new name only -> propagate to old
+      ctrl[[old_nm]] <- ctrl[[new_nm]]
+    } else {
+      # Both from defaults, or both from user -> new name wins; sync to old
+      # But only if the new name actually exists
+      if (!is.null(ctrl[[new_nm]])) {
+        ctrl[[old_nm]] <- ctrl[[new_nm]]
+      } else if (!is.null(ctrl[[old_nm]])) {
+        ctrl[[new_nm]] <- ctrl[[old_nm]]
+      }
+    }
+    ctrl
+  }
+  if (method == "cem") {
+    ctrl <- .sync(ctrl, "num_particles", "num_points",  user_ctrl)
+    ctrl <- .sync(ctrl, "num_trees",     "sample_size", user_ctrl)
+  }
+  if (method == "mcem") {
+    ctrl <- .sync(ctrl, "num_trees", "sample_size", user_ctrl)
+  }
+  ctrl
+}
+
+#' Tip start of the lineage that splits at each observed branching event
+#'
+#' The covariates \eqn{M} and \eqn{D} are functions of the pendant ages of the
+#' alive lineages, and a lineage's pendant age is measured from the last time
+#' it became a tip -- its \emph{tip start}, which is reset every time it
+#' speciates.  For an observed branching event that is the forward time of the
+#' \strong{parent} of the splitting node, and \code{0} for the two children of
+#' the crown.
+#'
+#' Events are returned in forward-time order, the order the C++ layer builds
+#' the observed tree in, so the k-th entry belongs to the k-th observed node.
+#' A 2-tip tree has no non-crown internal node and returns
+#' \code{numeric(0)}.
+#'
+#' @param phy A \code{phylo} object.
+#' @return Numeric vector of length \code{Nnode(phy) - 1}.
+#' @keywords internal
+.observed_parent_tip_start <- function(phy) {
+  h    <- ape::node.depth.edgelength(phy)        # forward time of every node
+  root <- ape::Ntip(phy) + 1L
+  int  <- setdiff(seq.int(root, max(phy$edge)), root)   # internal, not the root
+  if (length(int) == 0L) return(numeric(0))
+  par  <- stats::setNames(phy$edge[, 1L], phy$edge[, 2L])  # child node -> parent
+  ord  <- order(h[int])
+  unname(h[par[as.character(int[ord])]])
+}
+
+#' Branching times, and the topology the covariates need
+#'
+#' Returns the branching times in the crown-first (decreasing) order the C++
+#' layer expects, carrying the per-node \code{"parent_tip_start"} attribute
+#' when the input was a tree rather than a bare numeric vector.  Read it with
+#' \code{.pts()} and hand it to \code{augment_trees()} / \code{em_cpp()}.
+#'
+#' The attribute has one entry per node: the tip start of the lineage that
+#' splits at that observed branching event, then \code{-1} for the terminal
+#' marker at the present, which is not an event.  It is \code{numeric(0)} for a
+#' numeric input, where no topology exists.
+#' @keywords internal
+.extract_brts <- function(tree) {
+  # Branching times are measured back from the present.  A negative one is a
+  # node placed after the present: ape::branching.times() returns them for a
+  # tree that is not ultrametric, and the C++ layer would then score the
+  # present as an observed split and lose the last real one, for every model.
+  check_times <- function(brts) {
+    b <- as.numeric(brts)
+    if (any(!is.finite(b))) stop("branching times must be finite.")
+    if (length(b) && min(b) < -1e-8 * max(abs(b), 1))
+      stop(sprintf(paste0("%d branching time(s) are negative (the smallest is %.4g): ",
+                          "the tree is not ultrametric. Make it ultrametric first, for example ",
+                          "by extending every tip to the present (see ape::force.ultrametric)."),
+                   sum(b < -1e-8 * max(abs(b), 1)), min(b)), call. = FALSE)
+    brts
+  }
+  with_pts <- function(brts, phy) {
+    check_times(brts)
+    if (!is.null(phy)) {
+      attr(brts, "parent_tip_start") <- c(.observed_parent_tip_start(phy), -1)
+      attr(brts, "parent_id")        <- c(.observed_parent_id(phy), -1L)
+    }
+    brts
+  }
+  if (is.numeric(tree)) {
+    out <- sort(check_times(tree), decreasing = TRUE)
+    # A vector that already carries tip starts is one this function produced;
+    # keep them, unless sorting moved an entry, which would break the
+    # event-to-entry correspondence.
+    pts <- attr(tree, "parent_tip_start")
+    if (!is.null(pts) && identical(unname(out), unname(as.numeric(tree)))) {
+      attr(out, "parent_tip_start") <- pts
+      attr(out, "parent_id")        <- attr(tree, "parent_id")
+    }
+    return(out)
+  }
+  if (inherits(tree, "phylo")) {
+    return(with_pts(sort(ape::branching.times(tree), decreasing = TRUE), tree))
+  }
+  # simulate_tree() result: try $tes, then $tas (pruned to extant)
+  if (is.list(tree) && !inherits(tree, "phylo")) {
+    if (!is.null(tree$tes) && inherits(tree$tes, "phylo"))
+      return(with_pts(sort(ape::branching.times(tree$tes), decreasing = TRUE),
+                      tree$tes))
+    if (!is.null(tree$tas) && inherits(tree$tas, "phylo")) {
+      phy <- prune_to_extant(tree$tas)
+      return(with_pts(sort(ape::branching.times(phy), decreasing = TRUE), phy))
+    }
+    stop("List passed to estimate_rates() must contain '$tes' or '$tas'.")
+  }
+  stop("'tree' must be a phylo object, a simulate_tree() result, or a numeric branching-time vector.")
+}
+
+#' The parent tip starts carried by a branching-time vector
+#'
+#' \code{numeric(0)} when there are none, which is how the C++ layer is told
+#' that no topology is available.
+#' @keywords internal
+.pts <- function(brts) {
+  p <- attr(brts, "parent_tip_start")
+  if (is.null(p)) numeric(0) else as.numeric(p)
+}
+
+#' The lineage that splits at each observed branching event
+#'
+#' The ED covariate needs to know which lineage is which across events, which
+#' the tip start of \code{.observed_parent_tip_start} does not say.  Lineages
+#' are named as the C++ layer names them: the two crown lineages are
+#' \code{-2} (the one that splits first) and \code{-3}; the daughter born at
+#' the k-th observed branching event (forward-time order, 0-based) is lineage
+#' \code{k}.  Which child of a node continues the parent's lineage is fixed by
+#' a convention that any consistent rule would do for: the child whose subtree
+#' holds the lowest tip label continues, the other is the daughter.
+#'
+#' @param phy A \code{phylo} object.
+#' @return Integer vector of length \code{Nnode(phy) - 1}, in forward-time
+#'   order: the id of the lineage splitting at each event.
+#' @keywords internal
+.observed_parent_id <- function(phy) {
+  ntip <- ape::Ntip(phy)
+  root <- ntip + 1L
+  nn   <- max(phy$edge)
+  h    <- ape::node.depth.edgelength(phy)
+  int  <- setdiff(seq.int(root, nn), root)
+  if (length(int) == 0L) return(integer(0))
+  ord  <- int[order(h[int])]                      # events in forward time
+  ev   <- integer(nn); ev[] <- NA_integer_
+  ev[ord] <- seq_along(ord) - 1L                  # event index = daughter id
+  par  <- integer(nn); par[phy$edge[, 2L]] <- phy$edge[, 1L]
+  kids <- split(phy$edge[, 2L], phy$edge[, 1L])
+  # lowest tip label in every subtree, tips first then nodes bottom-up
+  rep_ <- integer(nn); rep_[seq_len(ntip)] <- seq_len(ntip)
+  for (v in rev(order(h[seq.int(root, nn)])) + root - 1L)
+    rep_[v] <- min(rep_[kids[[as.character(v)]]])
+  # the crown lineages: the root child that splits first is -2
+  rc <- kids[[as.character(root)]]
+  first <- function(v) if (v <= ntip) Inf else h[v]
+  crown <- if (first(rc[1]) <= first(rc[2])) c(-2L, -3L) else c(-3L, -2L)
+  crown_of <- stats::setNames(crown, rc)
+  # lineage through each internal node, parents before children
+  lin <- integer(nn); lin[] <- NA_integer_
+  for (v in ord) {
+    p <- par[v]
+    lin[v] <- if (p == root) crown_of[[as.character(v)]]
+              else if (rep_[v] == rep_[p]) lin[p] else ev[p]
+  }
+  unname(lin[ord])
+}
+
+#' The lineage ids carried by a branching-time vector, or \code{integer(0)}.
+#' @keywords internal
+.pid <- function(brts) {
+  p <- attr(brts, "parent_id")
+  if (is.null(p)) integer(0) else as.integer(p)
+}
+
+#' Relative parameter change, the statistic both MCEM stopping rules use
+#'
+#' The step in each coordinate is measured against that coordinate's own
+#' magnitude, with a floor so that a coordinate at or near zero is not
+#' measured against itself.  The floor carries the units of the parameter
+#' (see \code{.rel_floor}), so the statistic is unchanged when the tree and
+#' the rates are expressed in another unit of time.
+#'
+#' @param new,old Parameter vectors of equal length.
+#' @param floor_val Floor of the denominator, from \code{.rel_floor}.
+#' @return The largest relative coordinate change.
+#' @keywords internal
+.rel_change <- function(new, old, floor_val) {
+  max(abs(new - old) / pmax(abs(old), floor_val))
+}
+
+#' Floor of the relative-change denominator
+#'
+#' Under the linear link the parameters are rates, of dimension
+#' 1/time, and the only rate scale in the problem is the inverse crown age:
+#' the floor is \code{rel_floor / crown_age}, which rescales with the rates
+#' themselves.  Under the exponential link the parameters are log-rates, where
+#' an absolute step already is a relative change of the rate, so the floor is
+#' \code{rel_floor}.
+#'
+#' @param brts Branching times (crown age first, or any order).
+#' @param link Integer link code: 0 linear, 1 exponential.
+#' @param rel_floor Dimensionless floor. Default \code{1e-2}.
+#' @return A positive scalar.
+#' @keywords internal
+.rel_floor <- function(brts, link = 0L, rel_floor = 1e-2) {
+  if (as.integer(link) == 1L) return(rel_floor)
+  crown_age <- suppressWarnings(max(abs(as.numeric(brts))))
+  if (!is.finite(crown_age) || crown_age <= 0) return(rel_floor)
+  rel_floor / crown_age
+}
+
+#' @keywords internal
+.par_names <- function(model_bin) {
+  # Covariate slots {N, M = P/N, D = E - M, ED, K}: slot 2 is the mean-age
+  # coefficient (beta_M), slot 3 the deviation coefficient (beta_D), slot 4
+  # the evolutionary-distinctiveness coefficient (beta_ED), slot 5 the
+  # ancestral-splits coefficient (beta_K).
+  model_bin <- .pad_model_bin(model_bin)
+  lam <- c("beta_0",
+           if (model_bin[1]) "beta_N",
+           if (model_bin[2]) "beta_M",
+           if (model_bin[3]) "beta_D",
+           if (model_bin[4]) "beta_ED",
+           if (model_bin[5]) "beta_K")
+  mu <- c("gamma_0",
+          if (model_bin[1]) "gamma_N",
+          if (model_bin[2]) "gamma_M",
+          if (model_bin[3]) "gamma_D",
+          if (model_bin[4]) "gamma_ED",
+          if (model_bin[5]) "gamma_K")
+  c(lam, mu)
+}
+
+#' Validate init_pars for linear link models
+#'
+#' For linear link, lambda = max(0, beta_0 + beta_X * X). If the slope is
+#' too negative, lambda becomes zero at observed covariate values, causing
+#' IS collapse. This clamps slopes so lambda stays positive at the maximum
+#' covariate value seen in the tree.
+#' @keywords internal
+.validate_linear_init_pars <- function(init_pars, model_bin, brts,
+                                        lower_bound, upper_bound,
+                                        verbose = FALSE) {
+  n_tips <- length(brts) + 1L
+  max_t  <- max(brts)
+
+  # Maximum covariate magnitude for each active covariate (orthogonal basis
+  # {N, M = P/N, D = E - M}). M (mean pendant age) and D (focal deviation) are
+  # both bounded in magnitude by the crown age. This is a rough init-feasibility
+  # guard; MCEM refines from here. D is centred (can be negative), so this only
+  # guards the positive extreme.
+  max_covs <- c(
+    N = n_tips,
+    M = max_t,             # mean pendant age <= crown age
+    D = max_t              # focal deviation magnitude ~ crown age
+  )
+
+  n_pars   <- length(init_pars)
+  n_lam    <- n_pars %/% 2L    # number of lambda params (beta_0 + slopes)
+  active   <- which(model_bin != 0L)
+  cov_names <- c("N", "M", "D")
+  changed  <- FALSE
+
+  for (k in seq_along(active)) {
+    cov_idx <- active[k]
+    max_X   <- max_covs[cov_idx]
+    if (is.na(max_X) || max_X <= 0) next
+
+    # Lambda slope is at compact position 1 + k
+    slope_pos <- 1L + k
+    beta_0    <- init_pars[1L]
+    beta_X    <- init_pars[slope_pos]
+
+    # Check: beta_0 + beta_X * max_X > 0
+    if (beta_0 + beta_X * max_X <= 0) {
+      # Clamp: keep 10% lambda margin at max covariate
+      new_slope <- -0.9 * beta_0 / max_X
+      new_slope <- max(lower_bound[slope_pos], min(upper_bound[slope_pos], new_slope))
+      if (verbose) {
+        message(sprintf(
+          "  init_pars: clamping beta_%s from %.4f to %.4f (lambda>0 at %s=%.0f)",
+          cov_names[cov_idx], beta_X, new_slope, cov_names[cov_idx], max_X
+        ))
+      }
+      init_pars[slope_pos] <- new_slope
+      changed <- TRUE
+    }
+
+    # Same check for mu slope: gamma_0 + gamma_X * max_X > 0
+    mu_slope_pos <- n_lam + 1L + k
+    gamma_0  <- init_pars[n_lam + 1L]
+    gamma_X  <- init_pars[mu_slope_pos]
+
+    if (gamma_0 + gamma_X * max_X < 0) {
+      new_slope <- -0.9 * gamma_0 / max_X
+      new_slope <- max(lower_bound[mu_slope_pos], min(upper_bound[mu_slope_pos], new_slope))
+      if (verbose) {
+        message(sprintf(
+          "  init_pars: clamping gamma_%s from %.4f to %.4f (mu>=0 at %s=%.0f)",
+          cov_names[cov_idx], gamma_X, new_slope, cov_names[cov_idx], max_X
+        ))
+      }
+      init_pars[mu_slope_pos] <- new_slope
+      changed <- TRUE
+    }
+  }
+
+  init_pars
+}
+
+
+#' Build a conditioning function from a survival GAM
+#'
+#' Returns a function that takes an 8-element parameter vector (C++ layout)
+#' and returns \code{log(P_tree(pars))}, the log-probability that both basal
+#' lineages survive to the present.
+#' @keywords internal
+.build_cond_fun <- function(gam_fit, model_bin) {
+  force(gam_fit)
+  force(model_bin)
+  par_names <- .par_names(model_bin)
+  function(pars8) {
+    compact <- .contract_pars(pars8, model_bin)
+    nd <- as.data.frame(t(compact))
+    colnames(nd) <- par_names
+    p_tree <- predict_survival(gam_fit, nd)
+    log(max(p_tree, 1e-300))
+  }
+}
+
+#' @keywords internal
+.contract_pars <- function(pars8, model_bin) {
+  # pars8 is the full vector in either width: 8 (ED absent) or 10.
+  model_bin <- .pad_model_bin(model_bin)
+  if (length(pars8) < .n_full) pars8 <- c(pars8, rep(0, .n_full - length(pars8)))
+  active <- which(model_bin != 0L)
+  lam <- c(pars8[1L], pars8[.slot_beta[active]])
+  mu  <- c(pars8[5L], pars8[.slot_gamma[active]])
+  c(lam, mu)
+}
+
+#' Trace rows that are MCEM iterations
+#'
+#' Both drivers append the final E-step at the parameters they return as a
+#' trace row.  That row is not an iteration: it carries no M-step and no step
+#' metrics.  \code{.mcem_bdi} flags it \code{m_step = FALSE} and
+#' \code{.mcem_dynamic_fresh} flags it \code{final_estep = TRUE}; both flags
+#' are read here, so that anything counting or plotting the trace reports K
+#' rows for a K-iteration fit.
+#'
+#' @param mcem_df An MCEM trace data frame, or \code{NULL}.
+#' @return A logical vector over the rows of \code{mcem_df}.
+#' @keywords internal
+.mcem_iter_rows <- function(mcem_df) {
+  if (is.null(mcem_df) || nrow(mcem_df) == 0L) return(logical(0))
+  is_final <- rep(FALSE, nrow(mcem_df))
+  if ("final_estep" %in% names(mcem_df)) {
+    flag <- as.logical(mcem_df$final_estep)
+    flag[is.na(flag)] <- FALSE
+    is_final <- is_final | flag
+  }
+  if ("m_step" %in% names(mcem_df)) {
+    flag <- as.logical(mcem_df$m_step)
+    flag[is.na(flag)] <- TRUE
+    is_final <- is_final | !flag
+  }
+  !is_final
+}
+
+# The mean-field relaxation a BDI fit runs under.  "default" (or NULL) is
+# "auto" at complete sampling and a fixed 1/8 below it (experiment E10c); an
+# explicit "auto" or number is the user's and is passed through.
+#' @keywords internal
+.resolve_damping <- function(damping, rho) {
+  if (is.null(damping) || identical(damping, "default")) {
+    rho <- if (is.null(rho)) 1 else as.numeric(rho)
+    return(if (isTRUE(rho < 1)) 0.125 else "auto")
+  }
+  damping
+}
+
+#' @keywords internal
+.run_mcem <- function(brts, init_pars, lower_bound, upper_bound, ctrl,
+                      model = c(0L, 0L, 0L), link = 0L, cond_fun = NULL) {
+  # BDI covers the N-only models (cr, dd) and the D and ED models through
+  # their clade mean, on the linear and exponential links, at any rho in
+  # (0, 1].  What is left -- M- and K-dependent models -- uses the thinning
+  # proposal.  The message is unconditional and names the
+  # reason: the sampler the user asked for is not the sampler that runs.
+  if (identical(ctrl$sampling, "bdi") && !.bdi_supported(model, link, ctrl$rho)) {
+    reason <- .bdi_unsupported_reason(model, link, ctrl$rho)
+    message("sampling = \"bdi\" is not available for ", reason,
+            "; using the thinning sampler (\"dynamic_fresh\") instead.")
+    ctrl$sampling <- "dynamic_fresh"
+  }
+  # The model vector the thinning sampler is handed also names its proposal
+  # for an ED model (.proposal_model).  Resolved here, before the dispatch,
+  # so that a bad control$proposal is an error of this call and not an
+  # E-step failure the driver retries.
+  model_thinning <- .proposal_model(model, if (is.null(ctrl$proposal)) "ed" else ctrl$proposal)
+  # A sample size below 1 reaches the C++ E-step as a loop that accepts no
+  # tree and then indexes an empty weight vector.
+  if (!is.finite(ctrl$sample_size) || ctrl$sample_size < 1L)
+    stop(sprintf("control$num_trees must be at least 1 (got %s).",
+                 format(ctrl$sample_size)), call. = FALSE)
+  if (is.null(ctrl$maxN) || !is.finite(ctrl$maxN))
+    ctrl$maxN <- max(2000L, 10L * as.integer(ctrl$sample_size))
+  # sample_size > maxN makes every thinning E-step fail structurally. The BDI
+  # sampler draws each tree to completion and takes no maxN, so the check is
+  # scoped to the sampler that reads it, after the fallback above.
+  if (identical(ctrl$sampling, "dynamic_fresh") && ctrl$maxN < ctrl$sample_size)
+    stop(sprintf(paste0(
+      "control$maxN (%d) is smaller than control$num_trees (%d): the thinning ",
+      "E-step cannot accept num_trees augmented trees within maxN attempts.\n",
+      "  Set maxN >= num_trees, or leave maxN = NULL for max(2000, 10 * num_trees)."),
+      as.integer(ctrl$maxN), as.integer(ctrl$sample_size)), call. = FALSE)
+  raw <- switch(ctrl$sampling,
+    bdi             = .mcem_bdi(
+      brts        = brts,
+      pars        = init_pars,
+      sample_size = ctrl$sample_size,
+      max_missing = ctrl$max_missing,
+      lower_bound = lower_bound,
+      upper_bound = upper_bound,
+      max_iter    = ctrl$max_iter,
+      xtol        = ctrl$xtol,
+      tol         = ctrl$tol,
+      patience    = ctrl$patience,
+      num_threads = ctrl$num_threads,
+      verbose     = ctrl$verbose,
+      conditional = cond_fun,
+      model       = model,
+      link        = link,
+      max_time    = ctrl$max_time,
+      rho         = ctrl$rho,
+      stop_rule   = ctrl$stop_rule %||% "rel_change",
+      mc_batches  = ctrl$mc_batches %||% 5L,
+      mc_z        = ctrl$mc_z %||% 1.0,
+      mc_grow     = ctrl$mc_grow %||% 1.5,
+      max_draws   = ctrl$max_draws,
+      mesh        = ctrl$mesh,
+      damping     = .resolve_damping(ctrl$damping, ctrl$rho)
+    ),
+    dynamic_fresh   = .mcem_dynamic_fresh(
+      brts        = brts,
+      pars        = init_pars,
+      sample_size = ctrl$sample_size,
+      maxN        = ctrl$maxN,
+      max_missing = ctrl$max_missing,
+      lower_bound = lower_bound,
+      upper_bound = upper_bound,
+      max_iter    = ctrl$max_iter,
+      xtol        = ctrl$xtol,
+      tol         = ctrl$tol,
+      patience    = ctrl$patience,
+      num_threads = ctrl$num_threads,
+      verbose     = ctrl$verbose,
+      conditional = cond_fun,
+      stop_rule   = ctrl$stop_rule %||% "rel_change",
+      mc_batches  = ctrl$mc_batches %||% 5L,
+      mc_z        = ctrl$mc_z %||% 1.0,
+      mc_grow     = ctrl$mc_grow %||% 1.5,
+      max_draws   = ctrl$max_draws,
+      model       = model_thinning,
+      link        = link,
+      max_time    = ctrl$max_time,
+      rho         = ctrl$rho
+    ),
+    dynamic_recycle = stop("'dynamic_recycle' sampling not yet implemented."),
+    dynamic_mixed   = stop("'dynamic_mixed' sampling not yet implemented."),
+    stop("Unknown sampling scheme: ", ctrl$sampling)
+  )
+  # The drivers evaluate a final E-step at the parameters they return and
+  # report its fhat as `loglik` (NA when that E-step failed), so take the
+  # value from the driver.  The trace tail is the fallback for return shapes
+  # without the field, and is one iteration behind the returned parameters
+  # whenever the final E-step did not run.  Exact extraction: `$` would
+  # partial-match `loglik_var` and hand back a variance.
+  loglik <- raw[["loglik"]]
+  if (is.null(loglik)) {
+    fhat_vec <- raw$mcem$fhat
+    loglik   <- if (any(is.finite(fhat_vec)))
+      utils::tail(fhat_vec[is.finite(fhat_vec)], 1L) else NA_real_
+  }
+  loglik <- if (length(loglik) == 1L) as.numeric(loglik) else NA_real_
+  loglik_var <- if (!is.null(raw$loglik_var)) raw$loglik_var else NA_real_
+  # The drivers count completed E+M iterations themselves (the final
+  # E-step row of the trace is not one); fall back to the trace rows that
+  # are iterations, and report 0 when no E-step succeeded.
+  iterations <- if (!is.null(raw$iterations)) as.integer(raw$iterations)
+                else as.integer(sum(.mcem_iter_rows(raw$mcem)))
+  n_failed <- if (!is.null(raw[["n_failed"]])) as.integer(raw[["n_failed"]]) else NA_integer_
+  # whether the mean field ran under the default setting, so the note can say so
+  if (identical(ctrl$sampling, "bdi"))
+    raw$damping_default <- is.null(ctrl$damping) || identical(ctrl$damping, "default")
+  list(pars = raw$pars, loglik = loglik, loglik_var = loglik_var,
+       stop_reason = raw$stop_reason, iterations = iterations,
+       n_failed = n_failed, details = raw)
+}
+
+#' @keywords internal
+.run_cem <- function(brts, lower_bound, upper_bound, ctrl,
+                     model = c(0L, 0L, 0L), link = 0L, cond_fun = NULL) {
+  sd_vec <- ctrl$sd_vec
+  if (is.null(sd_vec)) sd_vec <- (upper_bound - lower_bound) / 4
+  raw <- emphasis_cem(
+    brts         = brts,
+    max_iter     = ctrl$max_iter,
+    num_points   = ctrl$num_points,
+    max_missing  = ctrl$max_missing,
+    sd_vec       = sd_vec,
+    lower_bound  = lower_bound,
+    upper_bound  = upper_bound,
+    maxN         = ctrl$maxN,
+    sample_size  = ctrl$sample_size,
+    shared_trees = ctrl$shared_trees,
+    disc_prop    = ctrl$disc_prop,
+    tol          = ctrl$tol,
+    patience     = ctrl$patience,
+    sd_decay     = ctrl$sd_decay,
+    sd_min_frac  = ctrl$sd_min_frac,
+    bias_correct = ctrl$bias_correct,
+    verbose      = ctrl$verbose,
+    num_threads  = ctrl$num_threads,
+    model        = model,
+    link         = link,
+    cond_fun     = cond_fun,
+    max_time     = ctrl$max_time,
+    rho          = ctrl$rho
+  )
+  if (identical(raw$converged, "all_failed"))
+    warning("CEM failed: all particles were rejected at every attempt. ",
+            "Try increasing num_particles (e.g. >= 20) or widening the ",
+            "parameter bounds.")
+  # Report the stable importance-sampling fhat of the RETURNED parameter vector
+  # (best_IS$fhat, a fresh re-evaluation of obtained_estim with the same
+  # conditioning), so that pars, loglik, and loglik_var all describe the same
+  # estimate. The per-iteration best_loglik is a noisy search value belonging to
+  # a different vector and must not be reported as the fit's log-likelihood; it
+  # is kept only as a fallback when the stable re-evaluation is unavailable.
+  loglik <- if (!is.null(raw$best_IS) && is.finite(raw$best_IS$fhat)) {
+    raw$best_IS$fhat
+  } else if (length(raw$best_loglik) > 0) {
+    raw$best_loglik[length(raw$best_loglik)]
+  } else {
+    NA_real_
+  }
+  list(pars = raw$obtained_estim, loglik = loglik,
+       loglik_var = raw$loglik_var, details = raw)
+}
+
+#' @keywords internal
+.run_gam <- function(brts, lower_bound, upper_bound, ctrl,
+                     model = c(0L, 0L, 0L), link = 0L, cond = NULL) {
+  if (!requireNamespace("mgcv", quietly = TRUE))
+    stop("Package 'mgcv' is required for method=\"gam\". ",
+         "Install it with install.packages(\"mgcv\").")
+
+  model_bin <- as.integer(model)
+  link_int  <- as.integer(link)
+  par_names <- .par_names(model_bin)
+  n_par     <- length(par_names)
+  compact_lb <- .contract_pars(lower_bound, model_bin)
+  compact_ub <- .contract_pars(upper_bound, model_bin)
+
+  # Build parameter grid
+  gp <- as.integer(ctrl$grid_points)
+  n_total <- as.integer(ctrl$n_grid %||% 0L)
+
+  if (n_total > 0L) {
+    # Latin Hypercube Sampling via the shared .lhs_sample() helper, which
+    # permutes EACH column with an independent sample.int(n) -- the property
+    # that gives LHS its space-filling guarantee. The previous inline version
+    # stratified each column in order and then applied a single shared row
+    # permutation to the whole matrix; one shared permutation cannot decorrelate
+    # columns, so the design collapsed onto the diagonal of the parameter box.
+    pars_grid <- .lhs_sample(n_total, compact_lb, compact_ub)
+    colnames(pars_grid) <- par_names
+    grid_label <- sprintf("  GAM grid: %d LHS points (%d parameters)\n",
+                          n_total, n_par)
+  } else {
+    # Factorial grid: gp points per dimension
+    grid_list <- lapply(seq_len(n_par), function(j) {
+      seq(compact_lb[j], compact_ub[j], length.out = gp)
+    })
+    names(grid_list) <- par_names
+    pars_grid <- as.matrix(expand.grid(grid_list))
+    grid_label <- sprintf("  GAM grid: %d points (%d per parameter, %d parameters)\n",
+                          nrow(pars_grid), gp, n_par)
+  }
+
+  if (ctrl$verbose) .vcat(grid_label)
+
+  # Evaluate IS log-likelihood at each grid point
+  surface <- estimate_likelihood_surface(
+    tree        = brts,
+    pars_mat    = pars_grid,
+    model       = model_bin,
+    sample_size = as.integer(ctrl$sample_size),
+    link        = c("linear", "exponential")[link_int + 1L],
+    max_missing = ctrl$max_missing,
+    max_lambda  = ctrl$max_lambda,
+    maxN        = ctrl$maxN,
+    num_threads = ctrl$num_threads,
+    verbose     = ctrl$verbose,
+    max_time    = ctrl$max_time,
+    rho         = ctrl$rho
+  )
+
+  # Apply conditioning correction before fitting GAM
+  if (!is.null(cond)) {
+    p_tree <- predict_survival(cond, pars_grid)
+    surface$fhat <- surface$fhat - log(p_tree)
+  }
+
+  n_valid <- sum(is.finite(surface$fhat))
+  if (n_valid < 10L)
+    stop("Only ", n_valid, " grid points have finite fhat; ",
+         "need at least 10. Try increasing grid_points or sample_size.")
+
+  if (ctrl$verbose)
+    .vcat(sprintf("  GAM surface: %d/%d valid grid points\n",
+                n_valid, nrow(surface)))
+
+  # Fit GAM to the surface
+  gam_fit <- train_likelihood_GAM(
+    surface, par_names = par_names,
+    spline_type = ctrl$spline_type,
+    verbose = isTRUE(ctrl$verbose)
+  )
+
+  # Optimize to find MLE (only over varying dimensions)
+  varying_mask  <- compact_lb != compact_ub
+  varying_names <- par_names[varying_mask]
+  mle <- find_MLE(gam_fit,
+                  lower_bound = compact_lb[varying_mask],
+                  upper_bound = compact_ub[varying_mask],
+                  par_names   = varying_names)
+
+  # Reconstruct full compact pars (fixed params keep their bound value)
+  full_compact <- compact_lb
+  full_compact[varying_mask] <- mle$pars
+  pars8 <- .expand_pars(full_compact, model_bin)
+
+  details <- list(
+    surface     = surface,
+    gam_fit     = gam_fit,
+    mle_optim   = mle$optim,
+    convergence = mle$convergence,
+    par_names   = par_names,
+    grid_points = gp
+  )
+
+  list(pars = pars8, loglik = mle$loglik, loglik_var = NA_real_,
+       details = details)
+}
+
+# --------------------------------------------------------------------------- #
+#  Public API                                                                  #
+# --------------------------------------------------------------------------- #
+
+#' Estimate diversification rates from a phylogenetic tree
+#'
+#' Unified entry point for parameter inference under the general
+#' diversification model. Accepts a simulated or empirical tree, extracts
+#' branching times (pruning to extant tips if needed), and dispatches to
+#' the chosen optimisation back-end.
+#'
+#' @param tree One of:
+#'   \itemize{
+#'     \item a \code{phylo} object (extant tips only recommended),
+#'     \item the list returned by \code{\link{simulate_tree}} (\code{$tes} is
+#'       used automatically, falling back to a pruned \code{$tas}), or
+#'     \item a numeric vector of branching times (crown-age ordering).
+#'   }
+#'   The covariate \code{D} is a lineage's pendant age -- measured from the
+#'   last time that lineage became a tip -- centred on the mean over the alive
+#'   lineages, so it is a function of the topology and not of the branching
+#'   times alone.  A \code{phylo} (or a \code{simulate_tree} result) carries
+#'   it; a bare numeric vector does not, and every observed lineage is then
+#'   recorded as dating from the crown, which leaves \code{D = 0} at every
+#'   observed branching event.  Fit \code{"d"} or \code{"nd"} from a tree, not
+#'   from branching times.
+#' @param method Optimisation method:
+#'   \describe{
+#'     \item{\code{"mcem"}}{Monte Carlo Expectation-Maximisation (default).
+#'       Iterates E- and M-steps until parameters stabilise (max relative
+#'       change < \code{tol} for \code{patience} consecutive iterations)
+#'       or \code{max_iter} is reached. Requires \code{init_pars}.}
+#'     \item{\code{"cem"}}{Monte Carlo Cross-Entropy Method. Initialises a
+#'       particle population randomly within the bounds and evolves it until
+#'       convergence (annealing exhausted, plateau, or \code{control$max_iter}
+#'       reached). Does not need \code{init_pars}.}
+#'     \item{\code{"gam"}}{GAM-based MLE. Evaluates the IS log-likelihood
+#'       on a grid spanning the bounds, fits a smooth GAM surface, and
+#'       optimises it via L-BFGS-B. One-shot (non-iterative); no
+#'       \code{init_pars} needed. Requires the \pkg{mgcv} package.}
+#'   }
+#' @param model Model specification. Accepts:
+#'   \itemize{
+#'     \item a formula such as \code{~ N}, \code{~ N + D}, \code{~ N + ED} or \code{~ N + K},
+#'     \item a string shortcut (\code{"cr"}, \code{"dd"}, \code{"d"},
+#'       \code{"nd"}, \code{"ed"}, \code{"ned"}, \code{"edc"}, \code{"nedc"},
+#'       \code{"k"}, \code{"nk"}), or
+#'     \item an integer vector \code{c(use_N, use_M, use_D, use_ED, use_K)}
+#'       (\code{use_M} is internal only and should be 0; a shorter vector is
+#'       an earlier layout and is padded; \code{use_ED = 3} selects the
+#'       centred covariate).
+#'   }
+#'   \code{model = "all"} fits the nested ladder \code{cr}, \code{dd},
+#'   \code{nd}, \code{ned}, \code{nk} (the last two need a \code{phylo}),
+#'   each started from the estimate of the
+#'   model it nests, with each model's box from \code{\link{auto_bounds}}
+#'   unless \code{control$bounds} names one per model, and returns the fits
+#'   with their \code{\link{compare_models}} table and its \code{chosen}
+#'   model, the fewest parameters within 2 AIC of the minimum (an
+#'   \code{emphasis_fits} object); \code{control$models} restricts the
+#'   ladder.
+#'   Default \code{"cr"} (constant rate). \code{"nd"} (\code{~ N + D}) is
+#'   diversity and age-imbalance; \code{"ned"} (\code{~ N + ED}) diversity and
+#'   evolutionary distinctiveness, which needs a \code{phylo}. \code{"nedc"}
+#'   (\code{~ N + EDc}) reads ED minus its mean over the lineages alive at the
+#'   same time, a covariate with clade mean zero, so that \code{beta_ED}
+#'   carries only the within-clade contrast and none of the clade-level level
+#'   that \code{N} tracks. \code{"nk"} (\code{~ N + K}) is diversity and the
+#'   number of speciation events on the path from the crown to the lineage,
+#'   hidden splits counted; it needs a \code{phylo} and runs on the thinning
+#'   sampler.
+#' @param init_pars Starting parameter vector. Required for \code{"mcem"};
+#'   ignored for \code{"cem"}. If \code{NULL} with \code{"mcem"}, the
+#'   midpoint of the bounds is used, with covariate slopes started at 0
+#'   (linear link) so that lambda stays positive during the early E-steps.
+#' @param control Named list of tuning parameters. Must include
+#'   \code{lower_bound} and \code{upper_bound}. Use
+#'   \code{\link{estimate_rates_control}} to inspect other defaults.
+#'   Key entries:
+#'   \describe{
+#'     \item{\code{lower_bound}}{Numeric vector of lower parameter bounds.
+#'       Length must be \code{2 + 2*sum(model)}.
+#'       Order: \code{c(beta_0, [beta_N], [beta_D],
+#'       gamma_0, [gamma_N], [gamma_D])} (D = age-imbalance covariate;
+#'       M is internal only).}
+#'     \item{\code{upper_bound}}{Numeric vector of upper parameter bounds
+#'       (same order).}
+#'     \item{\code{verbose}}{Print progress messages. Default \code{FALSE}.}
+#'   }
+#' @param link Link function: \code{"exponential"} (default),
+#'   \code{rate = exp(eta)}, under which the intercepts \code{beta_0} and
+#'   \code{gamma_0} are log rates; \code{"linear"},
+#'   \code{rate = max(0, eta)}, under which the parameters are rates and a
+#'   covariate can drive a rate to zero, where it is clipped.
+#' @param cond The survival probability to condition on, or \code{NULL}
+#'   (default) for no conditioning. When provided, the log-likelihood is
+#'   conditioned: \eqn{\ell_{\rm cond} = \ell - \log P_\theta(S)}, where
+#'   \eqn{P_\theta(S)} is the probability that both crown lineages leave a
+#'   sampled descendant at the present. \code{"surface"} (MCEM only) estimates
+#'   \eqn{P_\theta(S)} by direct simulation on local surfaces around the
+#'   iterate, for any model; the section \sQuote{Conditioning on survival}
+#'   describes it. The other forms give \eqn{P_\theta(S)} directly: a
+#'   function of the parameter data frame that returns it (the probability,
+#'   not its log), a surface from \code{\link{survival_surface}}, a GAM from
+#'   \code{\link{train_GAM}}, or a \code{nnet} object (see
+#'   \code{\link{predict_survival}}). The GAM is not accurate enough to
+#'   condition on.
+#' @return A list with class \code{"emphasis_fit"} containing:
+#'   \describe{
+#'     \item{\code{pars}}{Named numeric vector of parameter estimates.}
+#'     \item{\code{loglik}}{Final log-likelihood estimate. For MCEM this is
+#'       the importance-sampling estimate at the returned parameters, and is
+#'       \code{NA} when the E-step evaluating them failed.}
+#'     \item{\code{loglik_var}}{Bootstrap variance of \code{loglik} due to
+#'       Monte Carlo noise. Populated automatically when
+#'       \code{control$num_trees >= 2} (B = 200 replicates); \code{NA}
+#'       when \code{num_trees = 1}.}
+#'     \item{\code{n_pars}}{Number of free parameters (used for AIC):
+#'       parameters with \code{lower_bound == upper_bound} are fixed and
+#'       not counted.}
+#'     \item{\code{AIC}}{Akaike Information Criterion: \code{-2 * loglik + 2 * n_pars}.}
+#'     \item{\code{method}}{Method used (\code{"mcem"} or \code{"cem"}).}
+#'     \item{\code{model}}{Resolved binary model vector.}
+#'     \item{\code{rho}}{The sampling fraction the fit was computed at,
+#'       after the control merge.}
+#'     \item{\code{stop_reason}}{Why the MCEM run stopped (\code{"converged"},
+#'       \code{"max_iter"}, \code{"time_budget"}, \code{"e_step_failure"},
+#'       \code{"m_step_failure"}); \code{NA} for other methods.}
+#'     \item{\code{iterations}}{Number of completed MCEM iterations
+#'       (\code{0} when every E-step failed); \code{NA} for other methods.}
+#'     \item{\code{n_failed}}{Number of E- or M-step failures over the MCEM
+#'       run; \code{NA} for other methods.}
+#'     \item{\code{notes}}{Named character vector of what the measurements
+#'       and the run say about this fit: \code{size}, \code{starved} and
+#'       \code{turnover} (emitted as a warning or messages when the fit is
+#'       made), \code{mean_field} (the surrogate proposal's mean-field
+#'       iteration was relaxed below the full step, ran under a
+#'       \code{damping} other than \code{"auto"}, or did not converge within
+#'       its sweep budget: the setting, the sweeps taken, the relaxation and
+#'       residual of the last E-step, and how many E-steps of the run relaxed
+#'       or failed to converge) and \code{clock} (\code{max_time} ran out
+#'       inside an E-step or an M-step). \code{print()} shows the last two.}
+#'     \item{\code{details}}{Full output from the back-end function
+#'       (\code{.mcem_dynamic_fresh} or \code{emphasis_cem}); under
+#'       \code{cond = "surface"}, that of the last segment of the run kept.}
+#'     \item{\code{conditioning}}{Under \code{cond = "surface"} only: what the
+#'       conditioning did. \code{surfaces} built, \code{clades} simulated and
+#'       \code{seconds} spent simulating, over every run; \code{logP} and
+#'       \code{logP_se}, the direct \eqn{\log P(S)} at the estimate and its
+#'       standard error, with \code{logP_clades}; \code{loglik_uncond}, the
+#'       unconditioned log-likelihood at the estimate (\code{loglik} is it
+#'       minus \code{logP}); \code{start}, the start of the run kept
+#'       (\code{"unconditioned"}, \code{"nested"}, or \code{"none"} when no
+#'       conditioned segment finished within \code{max_time} and the fit is
+#'       the unconditioned one, conditioned at its estimate); \code{restart},
+#'       whether the run from the nested start was made; \code{surface}, the
+#'       last surface of the run kept; \code{runs}, the estimate, stop reason,
+#'       iterations, segments, surfaces, trace and conditioned log-likelihood
+#'       of each run; \code{settings}, \code{seed} and
+#'       \code{seconds_total}.}
+#'   }
+#' @section Conditioning on survival:
+#' The survival emulator of \code{\link{train_GAM}} is not adequate for any
+#' lineage-level model. In experiment E43
+#' (\url{https://franciscorichter.github.io/emphasis/experiments/E43.html}), GAMs
+#' trained on 2000, 5000 and 20 000 simulated clades for each of \code{d},
+#' \code{nd}, \code{ed}, \code{edc}, \code{ned}, \code{nedc}, \code{k} and
+#' \code{nk} had a 90th-percentile error of \eqn{\log P(S)} of 0.44 to 2.56,
+#' against the 0.05 its adequacy rule required, and the error did not fall
+#' with the training size.
+#'
+#' Under \code{cr} and \code{dd}, condition on the exact survival
+#' probability. The package does not export a function for it: pass one to
+#' \code{cond}. The function receives a data frame with one row per parameter
+#' point and columns named as the parameters (\code{beta_0}, \code{gamma_0}
+#' under \code{cr}), and returns \eqn{P_\theta(S)}, one value per row. Under
+#' constant rates on the exponential link, with \eqn{\lambda = e^{\beta_0}},
+#' \eqn{\mu = e^{\gamma_0}}, \eqn{d = \lambda - \mu}, crown age \eqn{T}
+#' and sampling fraction \eqn{\rho}, one crown lineage leaves a sampled
+#' descendant at the present with probability
+#' \deqn{p = \frac{\rho d}{\rho\lambda + (\lambda(1-\rho) - \mu)e^{-dT}}}{p = rho d / (rho lambda + (lambda (1 - rho) - mu) exp(-d T))}
+#' (\eqn{p = \rho / (1 + \rho\lambda T)} when \eqn{\lambda = \mu}); the two
+#' crown lineages are independent, so \eqn{P_\theta(S) = p^2}. The last
+#' example below codes it. Under \code{dd} the exact value solves the master
+#' equation of the clade size, which the package does not provide. E43's
+#' Monte Carlo reference agreed with the exact values to a median error of
+#' 0.007 (\code{cr}) and 0.008 (\code{dd}) in \eqn{\log P}.
+#'
+#' Under a lineage-level model (\code{d}, \code{nd}, \code{ed}, \code{edc},
+#' \code{ned}, \code{nedc}, \code{k}, \code{nk}), condition with
+#' \code{cond = "surface"}. A direct Monte Carlo estimate of
+#' \eqn{P_\theta(S)} (\code{\link{survival_mc}}) at a standard error of
+#' 0.01 in \eqn{\log P} took E43 a median of 2 to 29 seconds of one core,
+#' depending on the model, and the M-step evaluates \code{cond} at every
+#' parameter value it tries, so the surface method estimates it on a local
+#' quadratic instead, in four steps:
+#' \enumerate{
+#'   \item The unconditioned fit, from \code{init_pars}, to the stopping rule.
+#'   \item A surface of \eqn{\log P(S)} around its estimate
+#'     (\code{\link{survival_surface}}): direct simulation at \eqn{2p + 1}
+#'     points (\eqn{p} the coefficients of a full quadratic in the
+#'     parameters: 31 points for four parameters, 57 for six) in a box of
+#'     half-width \code{surface_radius} (0.03) of the fit's box per
+#'     coordinate, the same clades at every point, as many as give a standard
+#'     error of \code{surface_se} (0.02) at the centre, a clade past the
+#'     lineage cap counted as surviving; a quadratic by weighted least
+#'     squares, the tangent plane outside the box.
+#'   \item MCEM continued from the unconditioned estimate (clamped
+#'     \eqn{10^{-3}} of the box span inside the box) with the surface as
+#'     \code{cond}, in segments of \code{surface_segment} (25) iterations
+#'     that carry the draw count forward; the surface is rebuilt at the
+#'     iterate whenever the iterate leaves the inner half of its box, and the
+#'     run ends when the stopping rule is met inside the inner half, or on
+#'     \code{max_iter} iterations of the run or \code{max_time}.
+#'   \item When the unconditioned \code{gamma_0} is within
+#'     \code{surface_edge} (\eqn{10^{-3}}) of the box span of an edge, step 3
+#'     is also run from \code{init_pars} (the nested start: the estimate of
+#'     the nested model with the lineage-level coefficients at zero), and the
+#'     run with the higher conditioned log-likelihood is kept.
+#' }
+#' The reported log-likelihood is the run's unconditioned value minus a
+#' direct \eqn{\log P(S)} at its estimate (standard error
+#' \code{surface_final_se}, 0.01), and \code{loglik_var} adds that error's
+#' square. \code{max_time} bounds steps 1 to 4 together; the direct estimate
+#' at the estimate then gets \code{max_time} again, as the final E-step does.
+#' What the conditioning did is in the fit's \code{conditioning}. In the
+#' pilot that chose the method for experiment E46 (100 tips, \code{cr} and \code{dd}, where the
+#' exact conditioned maximum is known), steps 1 to 3 reached a median deficit
+#' of 0.0011 nats against the exact conditioned maximum (worst 0.13), and
+#' without step 4 a second, lower maximum on the extinction edge was kept on
+#' 4 of 10 \code{cr} trees at turnover 0.10.
+#'
+#' @examples
+#' set.seed(1)
+#' tr  <- simulate_tree(pars = log(c(0.5, 0.1)), max_t = 4, model = "cr")
+#' phy <- tr$tes
+#' # Exponential link (the default): the intercepts are log rates
+#' fit <- estimate_rates(phy, method = "mcem", model = "cr",
+#'   control = list(lower_bound = c(-3, -5), upper_bound = c(1, 0),
+#'                  max_iter = 10, num_trees = 50))
+#' fit
+#' \donttest{
+#' # Diversity-dependent model on the same tree
+#' fit_dd <- estimate_rates(phy, method = "mcem", model = "dd",
+#'   control = list(lower_bound = c(-3, -0.1, -5, -0.1),
+#'                  upper_bound = c(1, 0.1, 0, 0.1),
+#'                  max_iter = 10, num_trees = 50))
+#' fit_dd$pars
+#'
+#' # Conditioning a cr fit on its exact survival probability, P(S) = p^2
+#' cond_cr <- function(T, rho = 1) function(pars) {
+#'   lambda <- exp(pars$beta_0)
+#'   mu     <- exp(pars$gamma_0)
+#'   d      <- lambda - mu
+#'   p <- ifelse(abs(d) < 1e-12, rho / (1 + rho * lambda * T),
+#'               rho * d / (rho * lambda + (lambda * (1 - rho) - mu) * exp(-d * T)))
+#'   p^2
+#' }
+#' crown_age <- max(ape::branching.times(phy))
+#' fit_cond <- estimate_rates(phy, method = "mcem", model = "cr",
+#'   cond = cond_cr(T = crown_age),
+#'   control = list(lower_bound = c(-3, -5), upper_bound = c(1, 0),
+#'                  max_iter = 10, num_trees = 50))
+#' fit_cond
+#'
+#' # The same fit conditioned on local surfaces of a direct estimate, the
+#' # route for the lineage-level models
+#' fit_surf <- estimate_rates(phy, method = "mcem", model = "cr",
+#'   cond = "surface",
+#'   control = list(lower_bound = c(-3, -5), upper_bound = c(1, 0),
+#'                  max_iter = 10, num_trees = 50, max_time = 20))
+#' fit_surf$conditioning[c("surfaces", "clades", "logP", "logP_se", "start")]
+#' }
+#' @export
+estimate_rates <- function(tree,
+                           method    = c("mcem", "cem", "gam"),
+                           model     = "cr",
+                           init_pars = NULL,
+                           control   = list(),
+                           link      = "exponential",
+                           cond      = NULL) {
+  method    <- match.arg(method)
+
+  if (is.character(model) && length(model) == 1L && identical(tolower(model), "all"))
+    return(.fit_all(tree, method = method, control = control, link = link, cond = cond))
+
+  model_bin <- .resolve_model(model)
+  link_int  <- .resolve_link(link)
+
+  defaults <- estimate_rates_control(method)
+  ctrl     <- utils::modifyList(defaults, control)
+  # Resolve parameter aliases (old names still work)
+  ctrl <- .resolve_control_aliases(ctrl, method, user_ctrl = control)
+  ctrl$rho <- .check_rho(ctrl$rho)
+
+  lower_bound <- ctrl$lower_bound
+  upper_bound <- ctrl$upper_bound
+
+  if (is.null(lower_bound) || is.null(upper_bound))
+    stop("'lower_bound' and 'upper_bound' must be supplied in 'control'.\n",
+         "  e.g. control = list(lower_bound = c(...), upper_bound = c(...))")
+  if (!is.numeric(lower_bound) || !is.numeric(upper_bound))
+    stop("'lower_bound' and 'upper_bound' must be numeric vectors.")
+  if (length(lower_bound) != length(upper_bound))
+    stop("'lower_bound' and 'upper_bound' must have the same length.")
+
+  expected_n <- 2L + 2L * sum(model_bin != 0L)
+  if (length(lower_bound) != expected_n)
+    stop(.pars_error_msg(model_bin, expected_n))
+
+  brts <- .extract_brts(tree)
+
+  # Build conditioning function from survival GAM
+  cond_fun <- NULL
+  surface_cond <- identical(cond, "surface")
+  if (surface_cond && method != "mcem")
+    stop("cond = \"surface\" runs with method = \"mcem\" only.")
+  if (!is.null(cond) && !surface_cond) {
+    if (!(inherits(cond, "gam") || inherits(cond, "nnet") || is.function(cond) ||
+          inherits(cond, "emphasis_surface")))
+      stop("'cond' must be \"surface\", a survival emulator (a GAM from train_GAM(), a nnet object, a survival_surface(), or a function of the parameter data frame) or NULL.")
+    cond_fun <- .build_cond_fun(cond, model_bin)
+  }
+
+  if (is.null(init_pars) && method == "mcem") {
+    # The midpoint of a symmetric box has lambda == mu, and both samplers
+    # start there: the BDI transition probability is the lambda = mu limit
+    # of the CR kernel (.bdi_p_cr), not 0/0, so the midpoint needs no shift.
+    init_pars <- (lower_bound + upper_bound) / 2
+    # For linear link with DD/D models, the midpoint of the slope bounds
+    # can push lambda to zero (lambda = max(0, beta_0 + beta_X * X)).
+    # Start slopes near zero so lambda stays positive during early E-steps.
+    if (link_int == 0L && any(model_bin != 0L)) {
+      n_pars <- length(init_pars)
+      slope_idx <- which(model_bin != 0L)           # which covariates are active
+      lam_slopes <- 1L + slope_idx                   # compact positions for beta_X
+      mu_slopes  <- (n_pars / 2L) + 1L + slope_idx  # compact positions for gamma_X
+      all_slopes <- c(lam_slopes, mu_slopes)
+      all_slopes <- all_slopes[all_slopes <= n_pars]
+      # Clamp slopes: start at 0 if 0 is within bounds, else nearest bound
+      for (j in all_slopes) {
+        init_pars[j] <- max(lower_bound[j], min(upper_bound[j], 0))
+      }
+    }
+  }
+
+  # Validate init_pars: for linear link, ensure lambda > 0 at max covariate values
+  if (!is.null(init_pars) && link_int == 0L && any(model_bin != 0L)) {
+    init_pars <- .validate_linear_init_pars(
+      init_pars, model_bin, brts, lower_bound, upper_bound, verbose = ctrl$verbose
+    )
+  }
+
+  # Warn if the D model with linear link -- IS collapse is very likely
+  if (link_int == 0L && model_bin[3] == 1L &&
+      any(lower_bound < 0)) {
+    model_str <- .model_label(model_bin)
+    message(
+      "Note: ", model_str, " model with linear link can suffer IS collapse ",
+      "when the covariate drives lambda to zero.\n",
+      "  Consider using link=\"exponential\" for more stable estimation."
+    )
+  }
+
+  # Expand compact pars/bounds to full 8-element layout for C++
+  lb8 <- .expand_pars(lower_bound, model_bin)
+  ub8 <- .expand_pars(upper_bound, model_bin)
+  ip8 <- if (!is.null(init_pars)) .expand_pars(init_pars, model_bin) else NULL
+
+  if (ctrl$verbose) {
+    model_str <- .model_label(model_bin)
+    .vcat(sprintf(
+      "[estimate_rates] method=%s  model=%s  n_brts=%d  link=%s\n",
+      toupper(method), model_str, length(brts),
+      c("linear", "exponential")[link_int + 1L]
+    ))
+    if (method == "cem") {
+      ss   <- ctrl$num_trees
+      np   <- ctrl$num_particles
+      mode <- if (isTRUE(ctrl$shared_trees)) "shared (Mode 2)" else "independent (Mode 1)"
+      if (ss == 1L) {
+        fhat_desc <- paste0(
+          "  fhat           : logf - log_q  (single IS log-weight; high variance)\n",
+          "                   loglik_var = NA  -- use num_trees >= 5 for variance\n")
+      } else {
+        fhat_desc <- sprintf(paste0(
+          "  fhat           : log mean exp(logf - log_q)  over %d trees\n",
+          "                   loglik_var bootstrapped automatically (B=200)\n"), ss)
+        if (ss < 5L)
+          fhat_desc <- paste0(fhat_desc,
+            "                   NOTE: num_trees < 5; recommend >= 5 for stable variance\n")
+      }
+      .vcat(sprintf(paste0(
+        "  particles/iter : %d\n",
+        "  trees/particle : %d  =>  ~%d augmented trees per iteration\n"),
+        np, ss, np * ss))
+      .vcat(fhat_desc)
+      .vcat(sprintf("  tree mode      : %s\n  max_iter=%d\n",
+                  mode, ctrl$max_iter))
+    }
+    if (method == "mcem") {
+      sampling_str <- if (!identical(ctrl$sampling, "bdi")) ctrl$sampling else
+        if (.bdi_supported(model_bin, link_int, ctrl$rho))
+          if (model_bin[1L] == 0L) "BDI (exact)" else "BDI (mean-field)"
+        else
+          "dynamic_fresh (BDI not available for this model/link)"
+      .vcat(sprintf("  sampling=%s  num_trees=%d  max_iter=%d  tol=%.1e  patience=%d  xtol=%.1e  rho=%s\n",
+                  sampling_str, ctrl$num_trees, ctrl$max_iter, ctrl$tol,
+                  ctrl$patience, ctrl$xtol, format(ctrl$rho)))
+      if (ctrl$num_trees >= 2L)
+        .vcat("  loglik_var   : bootstrapped automatically (B=200)\n")
+      else
+        .vcat("  loglik_var   : NA (need num_trees >= 2)\n")
+    }
+    if (method == "gam") {
+      .vcat(sprintf("  grid_points=%d  sample_size=%d  spline=%s\n",
+                  ctrl$grid_points, ctrl$sample_size, ctrl$spline_type))
+    }
+  }
+
+  # A D model runs on the thinning proposal unless the caller names a sampler.
+  # The surrogate admits D (mean field D = 0, exact attachment) and on the E19
+  # design leaves 13-33 effective draws of 600 against 3-6 for thinning in four
+  # cells of five, but its fifth cell stays at 6.5 and one cell's selection
+  # rate falls (0.20 against 0.40), so the pre-registered condition for making
+  # it the D default (E19b) is not met; control$sampling = "bdi" asks for it.
+  if (method == "mcem" && model_bin[3L] != 0L && identical(ctrl$sampling, "bdi") &&
+      !("sampling" %in% names(control))) {
+    ctrl$sampling <- "dynamic_fresh"
+  }
+  # The surrogate's gate, applied here so that the fit records the sampler
+  # that ran (.run_mcem applies it too, for callers that skip this function).
+  if (method == "mcem" && identical(ctrl$sampling, "bdi") && !.bdi_supported(model_bin, link_int, ctrl$rho)) {
+    message("sampling = \"bdi\" is not available for ", .bdi_unsupported_reason(model_bin, link_int, ctrl$rho),
+            "; using the thinning sampler (\"dynamic_fresh\") instead.")
+    ctrl$sampling <- "dynamic_fresh"
+  }
+
+  # cond = "surface": the unconditioned fit, then the conditioned continuation
+  # on local surfaces of log P(S) (R/survival.R)
+  if (surface_cond)
+    return(.fit_surface_cond(tree, model = model, model_bin = model_bin, link = link,
+                             link_int = link_int, init_pars = init_pars,
+                             control = control, ctrl = ctrl, brts = brts))
+
+  raw <- switch(method,
+    mcem = .run_mcem(brts, ip8, lb8, ub8, ctrl, model = model_bin, link = link_int,
+                     cond_fun = cond_fun),
+    cem  = .run_cem(brts, lb8, ub8, ctrl, model = model_bin, link = link_int,
+                    cond_fun = cond_fun),
+    gam  = .run_gam(brts, lb8, ub8, ctrl, model = model_bin, link = link_int,
+                    cond = cond)
+  )
+
+  # Contract 8-element result back to compact
+  compact_pars <- .contract_pars(as.numeric(raw$pars), model_bin)
+  pars <- stats::setNames(compact_pars, .par_names(model_bin))
+  # Parameters fixed by lower_bound == upper_bound are not estimated
+  n_pars <- sum(lower_bound != upper_bound)
+
+  # For MCEM, the E-step fhat is unconditioned; apply correction here
+  loglik <- raw$loglik
+  if (!is.null(cond_fun) && method == "mcem" && is.finite(loglik)) {
+    loglik <- loglik - cond_fun(as.numeric(raw$pars))
+  }
+
+  aic <- if (is.finite(loglik)) -2 * loglik + 2 * n_pars else NA_real_
+  loglik_var <- if (!is.null(raw$loglik_var)) raw$loglik_var else NA_real_
+  stop_reason <- if (!is.null(raw$stop_reason)) as.character(raw$stop_reason) else NA_character_
+  iterations  <- if (!is.null(raw$iterations)) as.integer(raw$iterations) else NA_integer_
+  n_failed    <- if (!is.null(raw$n_failed)) as.integer(raw$n_failed) else NA_integer_
+
+  if (ctrl$verbose) {
+    .vcat(sprintf("[estimate_rates] loglik=%.4f  AIC=%.4f  pars: %s%s\n",
+                loglik, aic,
+                paste(names(pars), "=", round(pars, 4), collapse="  "),
+                if (!is.null(cond)) "  (conditioned)" else ""))
+  }
+
+  result <- list(pars = pars, loglik = loglik, loglik_var = loglik_var,
+                 n_pars = n_pars, AIC = aic,
+                 method = method, model = model_bin, rho = ctrl$rho,
+                 sampling = if (method == "mcem") ctrl$sampling else NA_character_,
+                 stop_reason = stop_reason, iterations = iterations,
+                 n_failed = n_failed,
+                 cond = !is.null(cond), details = raw$details)
+  class(result) <- "emphasis_fit"
+  result$notes <- .fit_notes(result, n_tips = length(brts) + 1L, link_int = link_int, emit = TRUE)
+  result
+}
+
+# What the measurements say about a fit like this one, stated with the number
+# each note rests on (the paper repository's E-series).  Three notes:
+#   size      a lineage-level covariate on fewer than 50 tips, where nothing
+#             has been measured;
+#   starved   an effective sample below 10 at the last E-step, which the
+#             pre-registered rules exclude from every selection statement;
+#   turnover  mu/lambda at the intercepts above 0.5, a boundary of the regime
+#             the estimator was measured in.
+# The starved note is a warning, the other two are messages.  Two more are
+# recorded without being emitted, and print() shows them:
+#   mean_field  the surrogate proposal's mean-field iteration was relaxed
+#               (damping below the full step), ran under a damping setting
+#               other than "auto", or did not converge within its sweeps;
+#   clock       max_time ran out inside an E-step or an M-step (the driver's time_note).
+# Returned invisibly as a character vector; estimate_rates() keeps it in the
+# fit as `notes`.
+#' @keywords internal
+.fit_notes <- function(fit, n_tips, link_int, emit = FALSE) {
+  notes <- character(0)
+  mb <- .pad_model_bin(fit$model)
+  lineage_level <- any(mb[3:5] != 0L)
+  if (lineage_level && is.finite(n_tips) && n_tips < 50L) {
+    notes <- c(notes, size = sprintf(paste0(
+      "%d tips: the smallest tree on which a lineage-level effect has been measured as ",
+      "selectable is 50 tips (an effect of 0.35 of the speciation rate, turnover 0.25); at 100 ",
+      "tips an effect of 0.35 is selected on 0.75 of trees and one of 0.15 on 0.50. Below 50 ",
+      "tips nothing is measured."), as.integer(n_tips)))
+  }
+  ess <- .fit_ess(fit)
+  if (is.finite(ess) && ess < 10) {
+    notes <- c(notes, starved = sprintf(paste0(
+      "the last E-step's effective sample is %.1f: the fit is sampler-limited and the ",
+      "precision of its estimate and of its log-likelihood is unquantified. The pre-registered ",
+      "rules exclude fits below 10 from every selection statement; more draws, the other ",
+      "proposal (control$sampling), or the exponential link may help."), ess))
+  }
+  p <- as.numeric(fit$pars); n_lam <- length(p) %/% 2L
+  if (length(p) >= 2L && all(is.finite(p[c(1L, n_lam + 1L)]))) {
+    lam0 <- if (link_int == 1L) exp(p[1L]) else p[1L]
+    mu0  <- if (link_int == 1L) exp(p[n_lam + 1L]) else p[n_lam + 1L]
+    turn <- if (is.finite(lam0) && lam0 > 0) mu0 / lam0 else NA_real_
+    if (is.finite(turn) && turn > 0.5) {
+      notes <- c(notes, turnover = sprintf(paste0(
+        "turnover at the intercepts is %.2f: above 0.5 is a boundary of the regime the ",
+        "estimator was measured in (at 100 tips and turnover 0.6 the thinning proposal's ",
+        "effective sample falls to 1 of 200 and the surrogate keeps 200 while giving up 0.14 ",
+        "of the estimate)."), turn))
+    }
+  }
+  mf <- .mean_field_note(fit)
+  if (!is.null(mf)) notes <- c(notes, mean_field = mf)
+  tn <- fit$details$time_note
+  if (is.character(tn) && length(tn) == 1L && nzchar(tn)) notes <- c(notes, clock = tn)
+  if (emit) {
+    if (!is.na(notes["starved"])) warning(notes[["starved"]], call. = FALSE)
+    for (nm in intersect(c("size", "turnover"), names(notes))) message("Note: ", notes[[nm]])
+  }
+  invisible(notes)
+}
+
+# The mean field the surrogate proposal was built on, from the trace of a
+# .mcem_bdi run: NULL unless some E-step relaxed the iteration (relaxation
+# below 1), some E-step's iteration did not converge within its sweep budget,
+# or the damping setting is not the default "auto".  The figures quoted are
+# those of the last E-step, the one the log-likelihood comes from.
+#' @keywords internal
+.mean_field_note <- function(fit) {
+  mc <- fit$details$mcem
+  if (is.null(mc) || !all(c("mf_converged", "mf_omega") %in% names(mc))) return(NULL)
+  ok <- !is.na(mc$mf_converged)
+  if (!any(ok)) return(NULL)
+  mc <- mc[ok, , drop = FALSE]
+  damping <- fit$details$damping
+  if (is.null(damping)) damping <- "auto"
+  by_default <- isTRUE(fit$details$damping_default)
+  relaxed <- is.finite(mc$mf_omega) & mc$mf_omega < 1
+  nonconv <- !as.logical(mc$mf_converged)
+  if (!any(relaxed) && !any(nonconv) && identical(damping, "auto")) return(NULL)
+  setting <- if (is.character(damping)) dQuote(damping, FALSE) else format(damping)
+  if (by_default)
+    setting <- paste0(setting, if (identical(damping, "auto")) ", the default at rho = 1"
+                               else ", the default at rho < 1")
+  last <- mc[nrow(mc), , drop = FALSE]
+  budget <- if ("mf_budget" %in% names(last) && is.finite(last$mf_budget))
+    sprintf(" of %d", as.integer(last$mf_budget)) else ""
+  sprintf(paste0(
+    "the surrogate proposal's mean field (damping = %s) at the last E-step took %d%s sweeps, ",
+    "the last at relaxation %.4g, and ended at residual %.2e: %s. Over the %d E-steps of the ",
+    "fit, %d relaxed the iteration below the full step and %d did not converge."),
+    setting,
+    as.integer(last$mf_sweeps), budget, last$mf_omega, last$mf_delta,
+    if (isTRUE(as.logical(last$mf_converged))) "converged" else "not converged",
+    nrow(mc), sum(relaxed), sum(nonconv))
+}
+
+# model = "all": the nested ladder of models, each fitted from the estimate
+# of the model it nests, and the fits ranked by compare_models().
+#
+#   cr -> dd -> {nd, ned, nk}
+#
+# The lineage-level models need the tree's topology (a phylo or a
+# simulate_tree() result) and are left out on a bare branching-time vector.
+# Each model's box is
+# auto_bounds() on the tree unless control$bounds names one per model
+# (list(dd = list(lower_bound, upper_bound), ...)); control$models restricts
+# the ladder.  The nested start is what the README recommends: an ED fit
+# started from the dd estimate takes seconds where one started from a point at
+# 1.7 times the generating net rate does not finish.
+#' @keywords internal
+.fit_all <- function(tree, method, control, link, cond) {
+  link_int <- .resolve_link(link)
+  brts <- .extract_brts(tree)
+  has_top <- length(.pid(brts)) == length(brts) && length(brts) > 0L
+  ladder <- c("cr", "dd", "nd", "ned", "nk")
+  if (!has_top) {
+    message("Note: the tree carries no topology (a phylo is needed), so ned and nk are left out.")
+    ladder <- setdiff(ladder, c("ned", "nk"))
+  }
+  if (!is.null(control$models)) {
+    keep <- vapply(control$models, function(m) .model_label(.resolve_model(m)), "")
+    ladder <- ladder[vapply(ladder, function(m) .model_label(.resolve_model(m)), "") %in% keep]
+    if (!length(ladder)) stop("control$models names no model of the ladder cr, dd, nd, ned, nk")
+  }
+  bounds <- control$bounds
+  ctrl0 <- control[setdiff(names(control), c("models", "bounds", "lower_bound", "upper_bound"))]
+  verbose <- isTRUE(control$verbose)
+  nested_of <- function(m) switch(m, cr = NA_character_, dd = "cr", nd = "dd", ned = "dd", nk = "dd")
+
+  fits <- list()
+  for (m in ladder) {
+    mb <- .resolve_model(m)
+    bx <- if (!is.null(bounds[[m]])) bounds[[m]] else
+      auto_bounds(tree, model = m, link = link, train_surv_gam = FALSE, verbose = FALSE,
+                  rho = if (is.null(control$rho)) 1 else control$rho)
+    lb <- as.numeric(bx$lower_bound); ub <- as.numeric(bx$upper_bound)
+    init <- NULL
+    nm <- nested_of(m)
+    if (!is.na(nm) && !is.null(fits[[nm]]) && all(is.finite(fits[[nm]]$pars))) {
+      init <- .contract_pars(.expand_pars(as.numeric(fits[[nm]]$pars), fits[[nm]]$model), mb)
+      span <- ub - lb
+      init <- pmin(pmax(init, lb + 1e-3 * span), ub - 1e-3 * span)
+    }
+    if (verbose) message(sprintf("[estimate_rates] model = %s%s", .model_label(mb),
+                                 if (is.null(init)) "" else sprintf(" (started from %s)", .model_label(.resolve_model(nm)))))
+    ctrl_m <- utils::modifyList(ctrl0, list(lower_bound = lb, upper_bound = ub))
+    fits[[m]] <- tryCatch(
+      estimate_rates(tree, method = method, model = m, init_pars = init, control = ctrl_m,
+                     link = link, cond = cond),
+      error = function(e) { warning(sprintf("model %s failed: %s", m, conditionMessage(e)), call. = FALSE); NULL })
+  }
+  done <- fits[!vapply(fits, is.null, TRUE)]
+  comparison <- if (length(done) >= 2L) do.call(compare_models, done) else NULL
+  if (all(c("nd", "ned") %in% names(done)))
+    message(paste0("Note: nd and ned both read the pendant edge; on 100-tip trees one path over N, D and ED ",
+                   "chooses the pair from a generator with only one of them (0.60 from nd, 0.45 from ned), ",
+                   "so an AIC margin between the two is a margin between two readings of the same edge."))
+  structure(list(fits = fits, comparison = comparison,
+                 chosen = if (is.null(comparison)) NA_character_ else attr(comparison, "chosen"),
+                 ladder = ladder, method = method, link = link),
+            class = "emphasis_fits")
+}
+
+#' Print method for the fits of \code{estimate_rates(model = "all")}
+#'
+#' @param x An \code{emphasis_fits} object.
+#' @param ... Ignored.
+#' @return \code{x}, invisibly.
+#' @export
+print.emphasis_fits <- function(x, ...) {
+  cat("emphasis fits (", x$method, ", link = ", x$link, "): ",
+      paste(x$ladder, collapse = " -> "), "\n\n", sep = "")
+  if (!is.null(x$comparison)) {
+    print(x$comparison)
+    cat(sprintf("\nchosen: %s (the fewest parameters within %g AIC of the minimum)\n",
+                x$chosen, attr(x$comparison, "margin")))
+  } else cat("fewer than two models finished\n")
+  failed <- names(x$fits)[vapply(x$fits, is.null, TRUE)]
+  if (length(failed)) cat("\nfailed:", paste(failed, collapse = ", "), "\n")
+  invisible(x)
+}
+
+
+#' Print method for emphasis_fit objects
+#'
+#' @param x An \code{emphasis_fit} object returned by \code{\link{estimate_rates}}.
+#' @param ... Additional arguments (ignored).
+#' @return \code{x}, invisibly.
+#' @export
+print.emphasis_fit <- function(x, ...) {
+  model_str <- .model_label(x$model)
+  cond_str <- if (isTRUE(x$cond)) ", conditioned" else ""
+  cat("emphasis fit (", x$method, ", model = ", model_str, cond_str, ")\n\n", sep = "")
+  cat("Parameters:\n")
+  print(round(x$pars, 6))
+  cat("\nLog-likelihood:", round(x$loglik, 4))
+  if (!is.na(x$loglik_var))
+    cat(sprintf("  (MC se: %.4f)", sqrt(x$loglik_var)))
+  ess <- .fit_ess(x); gap <- .fit_gap(x)
+  if (is.finite(ess)) {
+    cat(sprintf("\n  effective sample: %.0f", ess))
+    if (is.finite(gap) && gap >= 5e-4)
+      cat(sprintf("; the estimate sits at least %.3f below the truth (a log of a\n  Monte Carlo mean is biased down), which moves AIC by %.3f", gap, 2 * gap))
+  }
+  cat("\nAIC:           ", round(x$AIC, 4), "\n")
+  cat("n_pars:        ", x$n_pars, "\n")
+  if (!is.null(x$rho) && is.finite(x$rho) && x$rho < 1)
+    cat("rho:           ", x$rho, "(incomplete sampling)\n")
+  if (!is.null(x$iterations) && !is.na(x$iterations))
+    cat("Iterations:    ", x$iterations, "\n")
+  if (!is.null(x$stop_reason) && !is.na(x$stop_reason))
+    cat("Stop reason:   ", x$stop_reason, "\n")
+  for (nm in intersect(c("clock", "mean_field"), names(x$notes)))
+    cat(strwrap(paste0("Note: ", x$notes[[nm]]), width = 0.9 * getOption("width"), exdent = 2),
+        sep = "\n")
+  if (is.na(x$loglik)) {
+    reason <- if (!is.null(x$stop_reason) && !is.na(x$stop_reason))
+      paste0(" (", x$stop_reason, ")") else ""
+    cat("Did not converge", reason,
+        ": no log-likelihood was obtained; the parameters above are not estimates.\n",
+        sep = "")
+  }
+  invisible(x)
+}
+
+
+#' The effective sample size behind a fit's log-likelihood
+#'
+#' Wherever the fit recorded it: the MCEM drivers leave it in
+#' \code{details$final_IS}, the CEM driver in \code{details$best_IS}.
+#' @keywords internal
+.fit_ess <- function(f) {
+  for (slot in c("final_IS", "best_IS")) {
+    v <- f$details[[slot]]$ESS
+    if (!is.null(v) && length(v) >= 1L && is.finite(v[1L])) return(as.numeric(v[1L]))
+  }
+  NA_real_
+}
+
+#' Whether a fit's draw is heavy enough that its gap is unquantified
+#' @keywords internal
+.fit_gap_heavy <- function(f) {
+  for (slot in c("final_IS", "best_IS")) {
+    v <- f$details[[slot]]$gap_heavy
+    if (!is.null(v) && length(v) >= 1L && !is.na(v[1L])) return(isTRUE(v[1L]))
+  }
+  n <- NA_real_
+  for (slot in c("final_IS", "best_IS")) {
+    lw <- f$details[[slot]]$lw
+    if (!is.null(lw)) { n <- length(lw); break }
+  }
+  isTRUE(.jensen_gap(.fit_ess(f), n)$heavy)
+}
+
+#' The amount by which a fit's log-likelihood sits below the truth
+#'
+#' Recomputed from the recorded effective sample size when the fit predates
+#' the field, so that an old fit still compares safely.
+#' @keywords internal
+.fit_gap <- function(f) {
+  for (slot in c("final_IS", "best_IS")) {
+    v <- f$details[[slot]]$gap
+    if (!is.null(v) && length(v) >= 1L && is.finite(v[1L])) return(as.numeric(v[1L]))
+  }
+  ess <- .fit_ess(f)
+  n <- NA_real_
+  for (slot in c("final_IS", "best_IS")) {
+    lw <- f$details[[slot]]$lw
+    if (!is.null(lw)) { n <- length(lw); break }
+  }
+  .jensen_gap(ess, n)$gap
+}
+
+
+#' Compare fitted models by AIC, carrying the Monte Carlo handicap
+#'
+#' Ranks two or more fits from \code{\link{estimate_rates}} by AIC. Each fit's
+#' log-likelihood is a log of a Monte Carlo mean, so it sits below the
+#' log-likelihood it estimates; how far below grows as that fit's own effective
+#' sample falls, and the amounts do not cancel between models. A model that is
+#' harder to sample is therefore penalised for being harder to sample, and the
+#' AIC difference between two fits can be smaller than the difference in their
+#' biases.
+#'
+#' The returned table carries \code{ESS} and \code{loglik_gap} per fit and
+#' \code{AIC_swing}, twice the gap relative to the leader's, which is how much
+#' of the AIC difference the bias alone could account for.
+#'
+#' \code{ranking_at_risk} names the models that could overtake the leader once
+#' both biases are corrected. A model qualifies only if its own gap is larger
+#' than the leader's --- so that correcting both closes the distance --- and
+#' then either the swing reaches its \code{delta_AIC} or its draw is heavy
+#' enough that the swing understates the gap. A warning is issued with it.
+#'
+#' Two things follow that a caller should not have to infer. The attribute is
+#' about the ORDER, not about precision: when the leader is itself the
+#' heavily-handicapped fit, correcting the biases only widens its lead, so
+#' nothing is named and nothing is wrong with that. And it covers bias, not
+#' variance. A fit can lead on a log-likelihood estimated from a handful of
+#' effective draws --- measured: a winner with an effective sample of 6.5 of 300
+#' --- and be named by nothing here, because its \emph{expected} position is
+#' safe while its realised one is noisy. \code{loglik_se} and \code{ESS} are
+#' the columns for that, and they are in the table to be read.
+#'
+#' The row with the lowest AIC is not the model the table chooses. Among
+#' nested models the richer one has the lower AIC whenever its two extra
+#' parameters raise the log-likelihood by more than 2, which they do on a
+#' share of trees generated without them: with two extra parameters the
+#' likelihood-ratio statistic is chi-squared on two degrees of freedom under
+#' the null, so the richer model takes the minimum on about 13\% of null
+#' trees, and with three richer models offered beside the null, on more.
+#' Measured, on 20 trees a cell from a diversity-dependent generator at 50 to
+#' 200 tips: a lineage-level model had the minimum AIC on 2 to 7 of 20, and
+#' led by more than 2 AIC on 0 to 2 of 20 (E27). The \code{chosen} attribute
+#' is therefore the model with the fewest parameters among those within
+#' \code{margin} AIC units of the minimum, the one with the lower AIC when
+#' several share that number of parameters, and \code{within_margin} marks
+#' those rows; the full ranking is kept so that the margin can be read.
+#'
+#' A warning names the chosen model when its own effective sample is below
+#' 10 draws: its log-likelihood is then an estimate from a handful of
+#' histories and the margin it rests on is noise as much as evidence. The
+#' \code{ranking_at_risk} attribute covers the bias of unequal precision;
+#' this covers its variance.
+#'
+#' @param ... Two or more \code{emphasis_fit} objects. Names become the row
+#'   labels; unnamed arguments are labelled from the fitted model.
+#' @param margin AIC units within which two models are not told apart.
+#'   Default 2.
+#'
+#' @return A data frame, one row per fit, with columns
+#'   \code{model}, \code{n_pars}, \code{loglik}, \code{AIC}, \code{loglik_se},
+#'   \code{ESS}, \code{loglik_gap}, \code{gap_heavy}, \code{delta_AIC},
+#'   \code{AICw}, \code{AIC_swing} and \code{within_margin}, ordered by AIC,
+#'   with attributes \code{chosen} (the most parsimonious model within
+#'   \code{margin} of the minimum), \code{chosen_starved} (whether that
+#'   model's effective sample is below 10) and \code{ranking_at_risk}.
+#'
+#' @seealso \code{\link{estimate_rates}}
+#' @examples
+#' set.seed(1)
+#' tr  <- simulate_tree(pars = log(c(0.5, 0.1)), max_t = 4, model = "cr")
+#' phy <- tr$tes
+#' ctrl <- list(max_iter = 5, num_trees = 30)
+#' fit_cr <- estimate_rates(phy, method = "mcem", model = "cr",
+#'   control = c(ctrl, list(lower_bound = c(-3, -5), upper_bound = c(1, 0))))
+#' fit_dd <- estimate_rates(phy, method = "mcem", model = "dd",
+#'   control = c(ctrl, list(lower_bound = c(-3, -0.1, -5, -0.1),
+#'                          upper_bound = c(1, 0.1, 0, 0.1))))
+#' compare_models(cr = fit_cr, dd = fit_dd)
+#' @export
+compare_models <- function(..., margin = 2) {
+  fits <- list(...)
+  if (length(fits) < 2L)
+    stop("compare_models() requires at least two fitted models.")
+  if (!is.numeric(margin) || length(margin) != 1L || !is.finite(margin) || margin < 0)
+    stop("'margin' must be a single non-negative number.")
+
+  nms <- names(fits)
+  if (is.null(nms)) nms <- rep("", length(fits))
+  for (i in seq_along(fits)) {
+    if (nms[i] == "") nms[i] <- .model_label(fits[[i]]$model)
+  }
+
+  get_var <- function(f) if (!is.null(f$loglik_var)) f$loglik_var else NA_real_
+  vars <- vapply(fits, get_var, numeric(1L))
+  esss <- vapply(fits, .fit_ess, numeric(1L))
+  gaps <- vapply(fits, .fit_gap, numeric(1L))
+  heavy <- vapply(fits, .fit_gap_heavy, logical(1L))
+
+  tab <- data.frame(
+    model     = nms,
+    n_pars    = vapply(fits, `[[`, 0L, "n_pars"),
+    loglik    = vapply(fits, `[[`, 0.0, "loglik"),
+    AIC       = vapply(fits, `[[`, 0.0, "AIC"),
+    stringsAsFactors = FALSE
+  )
+
+  # Include MC standard errors if available
+  if (any(!is.na(vars))) {
+    tab$loglik_se <- sqrt(vars)
+  }
+  # Each log-likelihood is a log of a Monte Carlo mean, so each sits below the
+  # truth by an amount that grows as its own effective sample falls.  The
+  # amounts do not cancel between models, so they are carried, not hidden.
+  if (any(!is.na(esss))) { tab$ESS <- esss; tab$loglik_gap <- gaps; tab$gap_heavy <- heavy }
+
+  tab <- tab[order(tab$AIC, na.last = TRUE), ]
+  tab$delta_AIC <- tab$AIC - min(tab$AIC, na.rm = TRUE)
+  w <- exp(-0.5 * tab$delta_AIC)
+  tab$AICw <- w / sum(w, na.rm = TRUE)
+  rownames(tab) <- NULL
+
+  # Could the ranking be an artefact of unequal Monte Carlo precision?
+  #
+  # AIC = 2k - 2*loglik, and each loglik sits below the truth by its own gap
+  # g, so each AIC sits ABOVE the truth by 2g.  The model that is harder to
+  # sample carries the larger g and is penalised for that alone.  Correcting
+  # both, the gap between a model and the leader closes by 2(g_model -
+  # g_best), so the ordering is not safe wherever that reaches delta_AIC.
+  at_risk <- character(0)
+  if ("loglik_gap" %in% names(tab) && any(is.finite(tab$loglik_gap))) {
+    g_best <- tab$loglik_gap[1L]
+    swing  <- 2 * (tab$loglik_gap - g_best)
+    # `swing` understates once a draw is heavy (see .jensen_gap), so a heavy
+    # fit with any handicap at all is unquantified, not safe.
+    hv     <- if ("gap_heavy" %in% names(tab)) tab$gap_heavy %in% TRUE else rep(FALSE, nrow(tab))
+    risk   <- which(seq_len(nrow(tab)) > 1L & is.finite(swing) &
+                    (swing >= tab$delta_AIC | (hv & swing > 0)))
+    tab$AIC_swing <- swing
+    if (length(risk)) {
+      at_risk <- tab$model[risk]
+      warning(sprintf(paste0(
+        "compare_models(): the ranking is not safe against Monte Carlo ",
+        "precision. %s %s behind \"%s\" by %s AIC, but %s effective sample ",
+        "is smaller, which inflates %s AIC by up to %s on its own. Raise ",
+        "num_trees on the lower-ESS fits and compare again."),
+        paste(sprintf("\"%s\"", at_risk), collapse = ", "),
+        if (length(at_risk) == 1L) "is" else "are",
+        tab$model[1L],
+        paste(sprintf("%.2f", tab$delta_AIC[risk]), collapse = ", "),
+        if (length(at_risk) == 1L) "its" else "their",
+        if (length(at_risk) == 1L) "its" else "their",
+        paste(sprintf("%.2f", swing[risk]), collapse = ", ")),
+        call. = FALSE)
+    }
+  }
+  attr(tab, "ranking_at_risk") <- at_risk
+
+  # The choice: the fewest parameters among the models within `margin` of the
+  # minimum AIC, and among those the lowest AIC.  Both keys are explicit, so
+  # the choice does not rest on the row order the table happens to have.
+  tab$within_margin <- is.finite(tab$delta_AIC) & tab$delta_AIC <= margin
+  cand <- which(tab$within_margin)
+  chosen_row <- cand[order(tab$n_pars[cand], tab$AIC[cand])][1L]
+  chosen <- tab$model[chosen_row]
+  attr(tab, "chosen") <- chosen
+  attr(tab, "margin") <- margin
+  starved <- "ESS" %in% names(tab) && is.finite(tab$ESS[chosen_row]) && tab$ESS[chosen_row] < 10
+  attr(tab, "chosen_starved") <- starved
+  if (starved)
+    warning(sprintf(paste0(
+      "compare_models(): the chosen model \"%s\" rests on an effective sample of %.1f draws. ",
+      "Its log-likelihood, and so the margin it is chosen on, is estimated from a handful of ",
+      "histories. Raise num_trees or change the proposal (control$sampling) and compare again."),
+      chosen, tab$ESS[chosen_row]), call. = FALSE)
+
+  # Pairwise AIC Gaussian test when all fits have bootstrap variance
+  if (all(!is.na(vars)) && length(fits) >= 2L) {
+    n <- length(fits)
+    pmat <- matrix(NA_real_, n, n, dimnames = list(nms, nms))
+    for (i in seq_len(n - 1L)) {
+      for (j in seq(i + 1L, n)) {
+        T_ij   <- tab$AIC[tab$model == nms[i]] - tab$AIC[tab$model == nms[j]]
+        var_T  <- 4 * (vars[i] + vars[j])
+        if (is.finite(var_T) && var_T > 0) {
+          pmat[i, j] <- pmat[j, i] <-
+            2 * stats::pnorm(-abs(T_ij) / sqrt(var_T))
+        }
+      }
+    }
+    attr(tab, "pairwise_p") <- pmat
+  }
+
+  tab
+}
+
+
+#' @keywords internal
+.model_label <- function(model_bin) {
+  # {N = diversity, M = mean pendant age, D = focal deviation, ED = distinctiveness, K = ancestral splits}
+  model_bin <- .pad_model_bin(model_bin)
+  covs <- c("N", "M", "D", if (model_bin[4L] >= 3L) "EDc" else "ED", "K")[which(model_bin != 0L)]
+  if (length(covs) == 0L) return("CR")
+  paste(covs, collapse = " + ")
+}

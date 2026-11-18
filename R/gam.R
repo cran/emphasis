@@ -1,0 +1,1219 @@
+#' Train a survival-probability GAM on forward simulation results
+#'
+#' Fits a binomial GAM to estimate P(survival | parameters) from forward
+#' simulations run with \code{max_tries = 1} (one draw each, unconditioned
+#' on survival).  Each simulation row has a
+#' binary outcome: 1 if both crown lineages reached the present (\code{status}
+#' \code{"done"}) or the clade passed the lineage cap (\code{"too_large"}),
+#' 0 if it went extinct.  A clade stopped at the cap has survived so far, and
+#' the conditional likelihood divides by the probability of survival; counting
+#' it as extinct teaches the GAM a survival near zero wherever clades grow
+#' fast, which then rewards the fit for moving there (E36c of the paper).
+#'
+#' The GAM is not accurate enough to condition a fit on. In experiment E43
+#' (\url{https://franciscorichter.github.io/emphasis/experiments/E43.html}), GAMs
+#' trained on 2000, 5000 and 20 000 clades for each of the eight
+#' lineage-level models had a 90th-percentile error of \eqn{\log P(S)} of
+#' 0.44 to 2.56, against the 0.05 its adequacy rule required, and the error
+#' did not fall with the training size. Condition \code{cr} and \code{dd} fits
+#' on the exact survival probability, and lineage-level fits with
+#' \code{estimate_rates(cond = "surface")}; the section \sQuote{Conditioning
+#' on survival} of \code{\link{estimate_rates}} shows how.
+#'
+#' @param simulations List of \code{simulate_tree()} outputs (one per row of
+#'   \code{pars_mat}), produced with \code{max_tries = 1}.
+#' @param pars_mat Numeric matrix whose rows are the parameter vectors used to
+#'   generate \code{simulations}.  Column names are used as predictor names; if
+#'   absent, names are auto-generated from \code{model}.
+#' @param model String or binary integer vector (length 3 or 4) matching the
+#'   model used in simulation.  Used only when \code{pars_mat} has no column names.
+#'   Default \code{"cr"}.
+#' @param spline_type \code{"univariate"} (default) fits independent smooth
+#'   terms \code{s(x)} for each varying predictor.  \code{"bivariate"} fits
+#'   tensor-product smooths \code{te(x, y)} for every pair of varying
+#'   predictors, which can capture interaction effects.
+#' @param verbose Report the number of simulations and the survival rate
+#'   (default \code{TRUE}).
+#' @return A \code{gam} object (binomial family) representing
+#'   \eqn{P(\text{survival} \mid \theta)}.
+#' @seealso \code{\link{simulate_tree}}, \code{\link{predict_survival}}
+#' @examples
+#' set.seed(1)
+#' # Exponential link (the default): the intercepts are log rates
+#' pars_mat <- cbind(beta_0  = log(runif(100, 0.3, 1.2)),
+#'                   gamma_0 = log(runif(100, 0.05, 0.5)))
+#' sims <- simulate_tree(pars = pars_mat, max_t = 4, model = "cr",
+#'                       max_tries = 1)
+#' gam_uni <- train_GAM(sims$simulations, pars_mat, model = "cr")
+#' predict_survival(gam_uni, data.frame(beta_0 = log(0.8), gamma_0 = log(0.2)))
+#' @export
+train_GAM <- function(simulations, pars_mat, model = "cr",
+                      spline_type = c("univariate", "bivariate"),
+                      verbose = TRUE) {
+  spline_type <- match.arg(spline_type)
+  survived <- sapply(simulations, function(s) as.integer(s$status %in% c("done", "too_large")))
+
+  pars_df <- as.data.frame(pars_mat)
+  if (is.null(colnames(pars_mat)) || any(colnames(pars_mat) == "")) {
+    colnames(pars_df) <- .par_names(.resolve_model(model))
+  }
+
+  sim_data  <- cbind(pars_df, survived = survived)
+  par_names <- colnames(pars_df)
+
+  # Drop constant columns -- mgcv cannot fit a smooth on zero-variance predictors
+  varying <- par_names[sapply(par_names,
+                              function(p) length(unique(pars_df[[p]])) > 1L)]
+  if (length(varying) == 0L) stop("All parameter columns are constant; nothing to fit.")
+
+  if (spline_type == "univariate" || length(varying) < 2L) {
+    smooth_terms <- paste0("s(", varying, ")", collapse = " + ")
+  } else {
+    # Bivariate: tensor-product smooth for every pair of varying predictors
+    pairs        <- utils::combn(varying, 2L, simplify = FALSE)
+    smooth_terms <- paste(
+      vapply(pairs, function(p) paste0("te(", p[1L], ", ", p[2L], ")"),
+             character(1L)),
+      collapse = " + "
+    )
+  }
+
+  form <- stats::as.formula(paste("survived ~", smooth_terms))
+  if (verbose)
+    .vcat("Training", spline_type, "survival GAM on", nrow(sim_data),
+          "simulations (survival rate:", round(mean(survived), 3), ")...\n")
+  mgcv::gam(form, data = sim_data, family = stats::binomial())
+}
+
+
+#' Predict survival probability from a trained emulator
+#'
+#' Evaluates the survival probability \code{estimate_rates(cond = )} conditions
+#' through, in any of its four forms: a function that takes the parameter
+#' data frame and returns probabilities, a surface from
+#' \code{\link{survival_surface}}, a \code{gam} from
+#' \code{\link{train_GAM}}, or a \code{nnet} object.
+#'
+#' The GAM is not accurate enough to condition on: in experiment E43
+#' (\url{https://franciscorichter.github.io/emphasis/experiments/E43.html}) its
+#' 90th-percentile error of \eqn{\log P(S)} was 0.44 to 2.56 for every
+#' lineage-level model, against 0.05 required. Under \code{cr} and \code{dd}
+#' pass the exact survival probability as a function, and under a
+#' lineage-level model use \code{cond = "surface"}; the section
+#' \sQuote{Conditioning on survival} of \code{\link{estimate_rates}} gives the
+#' \code{cr} formula and the alternatives.
+#'
+#' @param gam_fit A \code{gam} object returned by \code{\link{train_GAM}}, a \code{nnet}
+#'   object trained on the same columns, an \code{"emphasis_surface"} from
+#'   \code{\link{survival_surface}}, or a function of a parameter data frame.
+#' @param newpars Numeric matrix or data frame of parameter values to predict
+#'   at.  Column names must match those used in \code{train_GAM}.
+#' @return Numeric vector of predicted survival probabilities.
+#' @examples
+#' set.seed(1)
+#' # Exponential link (the default): the intercepts are log rates
+#' pars_mat <- cbind(beta_0  = log(runif(100, 0.3, 1.2)),
+#'                   gamma_0 = log(runif(100, 0.05, 0.5)))
+#' sims <- simulate_tree(pars = pars_mat, max_t = 4, model = "cr",
+#'                       max_tries = 1)
+#' gam_fit <- train_GAM(sims$simulations, pars_mat, model = "cr")
+#' predict_survival(gam_fit, data.frame(beta_0  = log(c(0.5, 1.0)),
+#'                                      gamma_0 = log(c(0.1, 0.3))))
+#' @export
+predict_survival <- function(gam_fit, newpars) {
+  nd <- as.data.frame(newpars)
+  # The emulator is a GAM by default; a nnet object or a function of the parameter
+  # data frame (one row a point, columns named as the parameters) is carried the same
+  # way, so that estimate_rates(cond = ) can condition through either.
+  if (is.function(gam_fit)) return(as.numeric(gam_fit(nd)))
+  if (inherits(gam_fit, "emphasis_surface")) return(predict.emphasis_surface(gam_fit, nd, type = "P"))
+  if (inherits(gam_fit, "nnet")) return(as.numeric(stats::predict(gam_fit, newdata = nd, type = "raw")))
+  as.numeric(stats::predict(gam_fit, newdata = nd, type = "response"))
+}
+
+
+# =========================================================================== #
+#  Automatic bound detection                                                    #
+# =========================================================================== #
+
+#' Automatically determine parameter bounds via forward simulation
+#'
+#' Starts from a safe centre point (low rates, zero covariates) and expands
+#' outward along each parameter axis using bisection to find the feasibility
+#' boundary --- where trees transition from surviving with sensible size to
+#' going extinct or exploding.  Much more efficient than blanket LHS sampling
+#' over a wide box.  Optionally trains a survival GAM over the detected region;
+#' the bounds do not depend on it.
+#'
+#' @param tree A \code{phylo} object or anything accepted by
+#'   \code{\link{estimate_rates}}.
+#' @param model Model specification: \code{"cr"}, \code{"dd"}, etc.
+#' @param link Link function: \code{"exponential"} (default),
+#'   \code{rate = exp(eta)}, under which the intercepts \code{beta_0} and
+#'   \code{gamma_0} are log rates; \code{"linear"},
+#'   \code{rate = max(0, eta)}, under which the parameters are rates and a
+#'   covariate can drive a rate to zero, where it is clipped.
+#' @param n_test Number of replicate simulations per candidate point
+#'   to assess feasibility (default 5).
+#' @param bisect_steps Number of bisection steps per axis direction
+#'   (default 8; gives ~1/256 resolution).
+#' @param margin Fractional expansion of detected bounds (default 0.5).
+#' @param tip_range Multiplier range for acceptable tip counts relative
+#'   to the observed tree.  Default \code{c(0.1, 10)}.
+#' @param train_surv_gam If \code{TRUE} (default), train a survival GAM
+#'   on the detected region, from 2000 single forward draws. The GAM is not
+#'   accurate enough to condition a fit on (experiment E43; see
+#'   \code{\link{train_GAM}}).
+#' @param num_threads Parallel threads for batch simulation (default 1).
+#' @param verbose Print progress (default \code{TRUE}).
+#' @param rho Sampling fraction (0, 1]. Default \code{1} (complete sampling).
+#' @param surv_tries Draws allowed per simulation, the first included, when
+#'   judging whether a parameter vector produces surviving clades of a usable
+#'   size: an extinct clade is redrawn up to this many times in all (passed to
+#'   \code{simulate_tree} as \code{max_tries}). Default 20.
+#' @return A list with components:
+#'   \describe{
+#'     \item{lower_bound}{Numeric vector of lower bounds (compact layout).}
+#'     \item{upper_bound}{Numeric vector of upper bounds (compact layout).}
+#'     \item{survival_gam}{A \code{gam} object if trained, else \code{NULL}.}
+#'     \item{center}{The safe centre point used as starting location.}
+#'   }
+#' @examples
+#' set.seed(1)
+#' tr  <- simulate_tree(pars = log(c(0.5, 0.1)), max_t = 4, model = "cr")
+#' phy <- tr$tes
+#' # A coarse search without the survival GAM
+#' ab <- auto_bounds(phy, model = "cr", n_test = 3L, bisect_steps = 3L,
+#'                   train_surv_gam = FALSE, verbose = FALSE)
+#' ab$lower_bound
+#' ab$upper_bound
+#' \donttest{
+#' # The default search, which also trains the survival GAM (see train_GAM()
+#' # for why a fit should not be conditioned on it)
+#' ab2 <- auto_bounds(phy, model = "cr", verbose = FALSE)
+#' predict_survival(ab2$survival_gam, as.data.frame(t(ab2$center)))
+#' }
+#' @export
+auto_bounds <- function(tree, model = "cr", link = "exponential",
+                        n_test = 5L, bisect_steps = 8L,
+                        margin = 0.5,
+                        tip_range = c(0.1, 10),
+                        train_surv_gam = TRUE,
+                        num_threads = 1L,
+                        verbose = TRUE,
+                        rho = 1.0,
+                        surv_tries = 20L) {
+  .check_rho(rho, "rho")
+  model_bin <- .resolve_model(model)
+  link_int  <- .resolve_link(link)
+  n_pars    <- 2L + 2L * sum(model_bin != 0L)
+  pnames    <- .par_names(model_bin)
+
+  # Crown age and target tips from observed tree
+  if (inherits(tree, "phylo")) {
+    max_t  <- max(ape::branching.times(tree))
+    n_tips <- ape::Ntip(tree)
+  } else if (is.numeric(tree)) {
+    max_t  <- max(tree)
+    n_tips <- length(tree) + 1L
+  } else if (is.list(tree) && !is.null(tree$tes)) {
+    max_t  <- max(ape::branching.times(tree$tes))
+    n_tips <- ape::Ntip(tree$tes)
+  } else {
+    stop("'tree' must be a phylo, branching times, or simulate_tree result.")
+  }
+
+  brts    <- .extract_brts(tree)
+  tip_lo  <- max(2, floor(n_tips * tip_range[1]))
+  tip_hi  <- ceiling(n_tips * tip_range[2])
+  max_lin <- as.integer(max(20 * n_tips, 500))
+
+  # -- Safe center: observed net rate, zero covariates --------
+  r_hat  <- log(max(n_tips, 2) / 2) / max(max_t, 0.1)
+  mu_hat <- 0.2 * r_hat
+  lam_hat <- r_hat + mu_hat
+
+  if (link_int == 1L) {
+    center_lam <- c(log(max(lam_hat, 1e-4)))
+    center_mu  <- c(log(max(mu_hat, 1e-6)))
+  } else {
+    center_lam <- c(.rate_intercept(lam_hat, link_int))
+    center_mu  <- c(.rate_intercept(mu_hat, link_int))
+  }
+  active <- which(model_bin != 0L)
+  center <- c(center_lam, rep(0, length(active)),
+              center_mu,  rep(0, length(active)))
+  names(center) <- pnames
+
+  # Verify center is feasible
+  if (verbose) .vcat(sprintf(
+    "auto_bounds: %s link=%s (%d pars)\n",
+    paste(model_bin, collapse = ","),
+    c("linear", "exponential")[link_int + 1L],
+    n_pars
+  ))
+  if (verbose) .vcat(sprintf(
+    "  center: %s\n",
+    paste(round(center, 4), collapse = ", ")
+  ))
+
+  center_ok <- .test_feasibility(
+    center, model, link, max_t, max_lin,
+    n_test = 10L, tip_lo = tip_lo, tip_hi = tip_hi,
+    num_threads = num_threads, rho = rho, surv_tries = surv_tries
+  )
+
+  if (!center_ok) {
+    # Try a grid of centers near r_hat
+    if (verbose) .vcat("  center infeasible, searching...\n")
+    center <- .find_feasible_center(
+      model_bin, link_int, max_t, n_tips, model, link,
+      max_lin, tip_lo, tip_hi, num_threads,
+      rho = rho, surv_tries = surv_tries
+    )
+    if (is.null(center)) {
+      warning("auto_bounds: could not find a feasible center point.")
+      wide <- .wide_bounds(model_bin, link_int, max_t, n_tips)
+      return(list(
+        lower_bound = wide$lb, upper_bound = wide$ub,
+        survival_gam = NULL, center = NULL
+      ))
+    }
+    names(center) <- pnames
+    if (verbose) .vcat(sprintf(
+      "  found center: %s\n",
+      paste(round(center, 4), collapse = ", ")
+    ))
+  } else {
+    if (verbose) .vcat("  center feasible\n")
+  }
+
+  # -- Collect all feasible points to determine bounds ---------
+  wide <- .wide_bounds(model_bin, link_int, max_t, n_tips)
+  feasible_pts <- list(center)  # center is known feasible
+
+  # Phase 1: Axis-aligned bisection (original method)
+  if (verbose) .vcat("  Phase 1: axis-aligned bisection\n")
+  for (j in seq_len(n_pars)) {
+    if (verbose) .vcat(sprintf("    axis %s: ", pnames[j]))
+    hi <- .bisect_boundary(center, j, center[j], wide$ub[j],
+                           model, link, max_t, max_lin,
+                           n_test, bisect_steps, tip_lo, tip_hi, num_threads, rho = rho,
+                           surv_tries = surv_tries)
+    lo <- .bisect_boundary(center, j, center[j], wide$lb[j],
+                           model, link, max_t, max_lin,
+                           n_test, bisect_steps, tip_lo, tip_hi, num_threads, rho = rho,
+                           surv_tries = surv_tries)
+    if (verbose) .vcat(sprintf("[%.4f, %.4f]\n", lo, hi))
+    # Record the feasible boundary points
+    pt_hi <- center; pt_hi[j] <- hi; feasible_pts[[length(feasible_pts) + 1L]] <- pt_hi
+    pt_lo <- center; pt_lo[j] <- lo; feasible_pts[[length(feasible_pts) + 1L]] <- pt_lo
+  }
+
+  # Phase 1b: the constant-net-rate ray (turnover).
+  # A reconstructed tree pins the net rate lambda - mu far more tightly than it
+  # pins turnover mu / lambda, so the likelihood runs along a ridge on which
+  # both rates rise together.  Axis-aligned probes cannot follow that ridge:
+  # raising lambda with mu held low inflates the net rate until the simulated
+  # trees are too big to be feasible, and raising mu with lambda held low drives
+  # the net rate negative until they die out.  Both stop early, so the box ends
+  # up centred on the low-turnover guess it started from.  Probe the direction
+  # that holds lambda - mu fixed to first order at the center instead.  Under
+  # the linear link the parameters are the rates, so the ray is exact.
+  if (n_pars >= 2L) {
+    i_lam <- 1L
+    i_mu  <- 2L + length(active)
+    # d(rate)/d(intercept) at the center, by link.
+    d_of <- function(par, li) {
+      if (li == 1L) return(exp(par))        # rate = exp(par)
+      if (li == 2L) return(1 / exp(0.5))    # rate = par / exp(0.5)
+      1                                     # linear: rate = par
+    }
+    d_lam <- d_of(center[i_lam], link_int)
+    d_mu  <- d_of(center[i_mu],  link_int)
+    s_turn <- if (is.finite(d_lam / d_mu) && d_mu > 0) d_lam / d_mu else 1
+    slopes_turn <- unique(c(s_turn, 1))
+    slopes_turn <- slopes_turn[is.finite(slopes_turn) & slopes_turn > 0]
+
+    if (verbose) .vcat("  Phase 1b: constant-net-rate ray\n")
+    for (s in slopes_turn) {
+      direction <- rep(0, n_pars)
+      direction[i_lam] <- 1
+      direction[i_mu]  <- s
+      direction <- direction / sqrt(sum(direction^2))
+
+      hi_pt <- .bisect_direction(center, direction, wide, 1,
+                                 model, link, max_t, max_lin,
+                                 n_test, bisect_steps, tip_lo, tip_hi,
+                                 num_threads, rho = rho, surv_tries = surv_tries)
+      lo_pt <- .bisect_direction(center, direction, wide, -1,
+                                 model, link, max_t, max_lin,
+                                 n_test, bisect_steps, tip_lo, tip_hi,
+                                 num_threads, rho = rho, surv_tries = surv_tries)
+      if (!is.null(hi_pt)) feasible_pts[[length(feasible_pts) + 1L]] <- hi_pt
+      if (!is.null(lo_pt)) feasible_pts[[length(feasible_pts) + 1L]] <- lo_pt
+
+      if (verbose) {
+        hi_str <- if (!is.null(hi_pt)) sprintf("(%.4f, %.4f)", hi_pt[i_lam], hi_pt[i_mu]) else "---"
+        lo_str <- if (!is.null(lo_pt)) sprintf("(%.4f, %.4f)", lo_pt[i_lam], lo_pt[i_mu]) else "---"
+        .vcat(sprintf("    slope=%.2f: %s .. %s\n", s, lo_str, hi_str))
+      }
+    }
+  }
+
+  # Phase 2: Compensatory diagonals
+  # For each active covariate, explore the direction where the intercept
+  # and the covariate coefficient compensate each other, keeping the
+  # predicted rate at the observed covariate value roughly constant.
+  # This is general: eta = intercept + coeff * X_obs = const means
+  # d(intercept) = -X_obs * d(coeff), i.e. direction (1, -X_obs) in
+  # the (intercept, coeff) subspace.
+  obs_covs <- .observed_covariates(brts, model_bin)
+
+  if (length(obs_covs) > 0L) {
+    if (verbose) .vcat("  Phase 2: compensatory diagonals\n")
+
+    for (cov_info in obs_covs) {
+      i_int  <- cov_info$intercept_idx
+      i_coef <- cov_info$coeff_idx
+      X_obs  <- cov_info$X_obs
+
+      if (verbose) .vcat(sprintf("    %s (X_obs=%.2f):\n", cov_info$name, X_obs))
+
+      # Explore multiple compensatory slopes:
+      # The exact compensatory slope is X_obs, but we also explore
+      # shallower slopes (X_obs/2, X_obs/5, 1) to push the intercept further.
+      # Each slope s means: direction = (1, -s) in the (intercept, coeff) subspace.
+      slopes <- unique(c(X_obs, X_obs / 2, X_obs / 5, X_obs / 20, 1, 0.1))
+
+      for (s in slopes) {
+        direction <- rep(0, n_pars)
+        direction[i_int]  <- 1
+        direction[i_coef] <- -s
+        direction <- direction / sqrt(sum(direction^2))
+
+        hi_pt <- .bisect_direction(center, direction, wide, 1,
+                                   model, link, max_t, max_lin,
+                                   n_test, bisect_steps, tip_lo, tip_hi, num_threads, rho = rho,
+                           surv_tries = surv_tries)
+        lo_pt <- .bisect_direction(center, direction, wide, -1,
+                                   model, link, max_t, max_lin,
+                                   n_test, bisect_steps, tip_lo, tip_hi, num_threads, rho = rho,
+                           surv_tries = surv_tries)
+
+        if (!is.null(hi_pt)) feasible_pts[[length(feasible_pts) + 1L]] <- hi_pt
+        if (!is.null(lo_pt)) feasible_pts[[length(feasible_pts) + 1L]] <- lo_pt
+
+        if (verbose) {
+          hi_str <- if (!is.null(hi_pt)) sprintf("(%.4f, %.4f)", hi_pt[i_int], hi_pt[i_coef]) else "---"
+          lo_str <- if (!is.null(lo_pt)) sprintf("(%.4f, %.4f)", lo_pt[i_int], lo_pt[i_coef]) else "---"
+          .vcat(sprintf("      slope=%.1f: %s .. %s\n", s, lo_str, hi_str))
+        }
+      }
+
+      # Same for the extinction side
+      i_int_mu  <- cov_info$mu_intercept_idx
+      i_coef_mu <- cov_info$mu_coeff_idx
+
+      for (s in slopes) {
+        dir_mu <- rep(0, n_pars)
+        dir_mu[i_int_mu]  <- 1
+        dir_mu[i_coef_mu] <- -s
+        dir_mu <- dir_mu / sqrt(sum(dir_mu^2))
+
+        hi_mu <- .bisect_direction(center, dir_mu, wide, 1,
+                                   model, link, max_t, max_lin,
+                                   n_test, bisect_steps, tip_lo, tip_hi, num_threads, rho = rho,
+                           surv_tries = surv_tries)
+        lo_mu <- .bisect_direction(center, dir_mu, wide, -1,
+                                   model, link, max_t, max_lin,
+                                   n_test, bisect_steps, tip_lo, tip_hi, num_threads, rho = rho,
+                           surv_tries = surv_tries)
+        if (!is.null(hi_mu)) feasible_pts[[length(feasible_pts) + 1L]] <- hi_mu
+        if (!is.null(lo_mu)) feasible_pts[[length(feasible_pts) + 1L]] <- lo_mu
+      }
+    }
+  }
+
+  # Phase 3: Random directions.
+  # Use a fixed seed for reproducible feasibility directions, but save and
+  # restore the caller's global RNG state so auto_bounds() does not silently
+  # reset the user's random stream mid-analysis.
+  n_random <- max(4L, n_pars)
+  if (verbose) .vcat(sprintf("  Phase 3: %d random directions\n", n_random))
+  .ab_old_seed <- if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE))
+    get(".Random.seed", envir = .GlobalEnv) else NULL
+  set.seed(12345L)  # reproducible feasibility directions
+  for (k in seq_len(n_random)) {
+    direction <- stats::rnorm(n_pars)
+    direction <- direction / sqrt(sum(direction^2))
+    hi_pt <- .bisect_direction(center, direction, wide, 1,
+                               model, link, max_t, max_lin,
+                               n_test, bisect_steps, tip_lo, tip_hi, num_threads, rho = rho,
+                           surv_tries = surv_tries)
+    lo_pt <- .bisect_direction(center, direction, wide, -1,
+                               model, link, max_t, max_lin,
+                               n_test, bisect_steps, tip_lo, tip_hi, num_threads, rho = rho,
+                           surv_tries = surv_tries)
+    if (!is.null(hi_pt)) feasible_pts[[length(feasible_pts) + 1L]] <- hi_pt
+    if (!is.null(lo_pt)) feasible_pts[[length(feasible_pts) + 1L]] <- lo_pt
+  }
+  # Restore the caller's RNG state (see note above the Phase 3 seed).
+  if (is.null(.ab_old_seed)) {
+    if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE))
+      rm(".Random.seed", envir = .GlobalEnv)
+  } else {
+    assign(".Random.seed", .ab_old_seed, envir = .GlobalEnv)
+  }
+
+  # -- Compute bounds as component-wise min/max of all feasible points --
+  feas_mat <- do.call(rbind, feasible_pts)
+  lb <- apply(feas_mat, 2, min)
+  ub <- apply(feas_mat, 2, max)
+
+  # Add margin
+  span <- ub - lb
+  span <- pmax(span, 1e-6)
+  lb <- pmax(lb - margin * span, wide$lb)
+  ub <- pmin(ub + margin * span, wide$ub)
+
+  if (verbose) {
+    .vcat(sprintf("  %d feasible points collected\n", nrow(feas_mat)))
+    .vcat("  final bounds:\n")
+    for (j in seq_len(n_pars)) {
+      .vcat(sprintf("    %s: [%.4f, %.4f]\n", pnames[j], lb[j], ub[j]))
+    }
+  }
+
+  # -- IS feasibility diagnostic (informational only) ----------
+  if (verbose) {
+    .vcat("  IS feasibility check...\n")
+    .diagnose_is_bounds(center, lb, ub, brts, model_bin, link_int, verbose,
+                        rho = rho)
+  }
+
+  # -- Survival GAM on detected region ------------------------
+  surv_gam <- NULL
+  if (train_surv_gam) {
+    if (verbose) .vcat("  training survival GAM...\n")
+    n_gam   <- 2000L   # the size at which the survival GAM meets E36c's accuracy limit
+    gam_mat <- .lhs_sample(n_gam, lb, ub)
+    colnames(gam_mat) <- pnames
+
+    gam_sims <- simulate_tree(
+      pars = gam_mat, max_t = max_t,
+      model = model, link = link,
+      max_tries = 1,
+      max_lin = max_lin,
+      num_threads = num_threads,
+      rho = rho
+    )
+
+    surv_gam <- train_GAM(
+      gam_sims$simulations, gam_mat, model = model, verbose = verbose
+    )
+  }
+
+  list(
+    lower_bound  = stats::setNames(lb, pnames),
+    upper_bound  = stats::setNames(ub, pnames),
+    survival_gam = surv_gam,
+    center       = center
+  )
+}
+
+
+# Intercept that puts the per-lineage rate at `rate` when the covariate term
+# of the linear predictor is zero.
+#
+#   linear (0)      rate = max(0, beta_0)                 -> beta_0 = rate
+#   exponential (1) rate = exp(beta_0)                    -> beta_0 = log(rate)
+.rate_intercept <- function(rate, link_int) {
+  if (link_int == 1L) return(log(rate))
+  rate
+}
+
+
+# Total event rate at the crown: t = 0, N = 2, both lineages born at 0, so
+# P = 0, M = P/N = 0 and D = E - M = 0 and only the N term contributes to the
+# covariate part of the linear predictor.
+#
+# The simulator starts here, and rnd_t::expon returns 1e20 for a non-positive
+# total rate (general_tree.hpp:45-47), so the run ends at once with the 2-row
+# crown L-table and status "done".  A parameter value that does that is not
+# feasible, and without this check it would be counted as feasible.
+.crown_rate_positive <- function(pars, model_bin, link_int) {
+  p8      <- .expand_pars(pars, model_bin)
+  eta_lam <- 2 * p8[2L]        # beta_N * N with M = D = 0
+  eta_mu  <- 2 * p8[6L]        # gamma_N * N
+  if (link_int == 1L) {
+    lam <- exp(p8[1L] + eta_lam)
+    mu  <- exp(p8[5L] + eta_mu)
+  } else {
+    lam <- max(0, p8[1L] + eta_lam)
+    mu  <- max(0, p8[5L] + eta_mu)
+  }
+  isTRUE(is.finite(lam) && is.finite(mu) && (lam + mu) > 0)
+}
+
+
+# Test whether a parameter vector produces feasible trees.
+# Returns TRUE if >= 50% of n_test sims survive with sensible tips.
+#
+# A tree of exactly 2 tips carries no branching event beyond the crown, and is
+# what the simulator returns both for a non-positive total rate and for a rate
+# too low to produce a surviving split, so it is not accepted whatever tip_lo
+# asks for.
+.test_feasibility <- function(pars, model, link, max_t, max_lin,
+                              n_test = 5L, tip_lo = 2, tip_hi = 500,
+                              num_threads = 1L, rho = 1.0,
+                              surv_tries = 20L) {
+  if (!.crown_rate_positive(pars, .resolve_model(model), .resolve_link(link)))
+    return(FALSE)
+
+  # The observed tree survived to the present, so feasibility is a question
+  # about the SURVIVING clades a parameter vector produces, not about how often
+  # it produces one.  Judging unconditionally made the test a survival test:
+  # at high turnover most draws die out, ntips is 0 for them, and the vector was
+  # declared infeasible however well its survivors matched the data.  That is
+  # what excluded high-turnover optima from the box before any likelihood was
+  # evaluated (audit finding H74; measured on the study's own pipeline arm, the
+  # box missed the exact MLE on 25% of trees and the conditioned MLE on 35%).
+  #
+  # A retry budget buys survivors where they are rare; the size test then runs
+  # on the survivors alone, and a vector that cannot produce two survivors
+  # within the budget is infeasible for a reason that is about survival.
+  pars_mat <- matrix(rep(pars, n_test), nrow = n_test, byrow = TRUE)
+  sims <- simulate_tree(
+    pars = pars_mat, max_t = max_t,
+    model = model, link = link,
+    max_tries = surv_tries, max_lin = max_lin,
+    num_threads = num_threads,
+    rho = rho
+  )
+  ntips <- sapply(sims$simulations, function(s) {
+    if (s$status == "done" && !is.null(s$tes))
+      length(s$tes$tip.label) else 0L
+  })
+  tip_min <- max(tip_lo, 3)
+  surv <- ntips > 0L
+  if (sum(surv) < 2L) return(FALSE)
+  sum(ntips[surv] >= tip_min & ntips[surv] <= tip_hi) >= ceiling(sum(surv) / 2)
+}
+
+
+# Search for a feasible center by trying a grid of rate values.
+.find_feasible_center <- function(model_bin, link_int, max_t, n_tips,
+                                  model, link, max_lin, tip_lo, tip_hi,
+                                  num_threads, rho = 1.0, surv_tries = 20L) {
+  r_hat  <- log(max(n_tips, 2) / 2) / max(max_t, 0.1)
+  active <- which(model_bin != 0L)
+
+  # Try a grid of baseline rate multipliers
+  mults <- c(1, 0.5, 2, 0.25, 3, 0.1, 5)
+  mu_fracs <- c(0.2, 0.0, 0.5, 0.1)
+
+  for (m in mults) {
+    for (mf in mu_fracs) {
+      lam <- r_hat * m / (1 - mf)
+      mu  <- lam * mf
+      if (link_int == 1L) {
+        cand <- c(log(max(lam, 1e-4)), rep(0, length(active)),
+                  log(max(mu, 1e-6)), rep(0, length(active)))
+      } else {
+        cand <- c(.rate_intercept(max(lam, 1e-4), link_int), rep(0, length(active)),
+                  .rate_intercept(max(mu, 0), link_int), rep(0, length(active)))
+      }
+      ok <- .test_feasibility(
+        cand, model, link, max_t, max_lin,
+        n_test = 5L, tip_lo = tip_lo, tip_hi = tip_hi,
+        num_threads = num_threads, rho = rho, surv_tries = surv_tries
+      )
+      if (ok) return(cand)
+    }
+  }
+  NULL
+}
+
+
+# Bisection to find the boundary of feasibility along one axis.
+# Starts from center[j] (feasible) and probes toward `target`.
+# Returns the last feasible value found.
+.bisect_boundary <- function(center, j, safe, target,
+                             model, link, max_t, max_lin,
+                             n_test, steps, tip_lo, tip_hi,
+                             num_threads, rho = 1.0, surv_tries = 20L) {
+  lo <- safe
+  hi <- target
+
+  for (s in seq_len(steps)) {
+    mid <- (lo + hi) / 2
+    cand <- center
+    cand[j] <- mid
+
+    ok <- .test_feasibility(
+      cand, model, link, max_t, max_lin,
+      n_test = n_test, tip_lo = tip_lo, tip_hi = tip_hi,
+      num_threads = num_threads, rho = rho, surv_tries = surv_tries
+    )
+
+    if (ok) {
+      lo <- mid   # feasible -- push further
+    } else {
+      hi <- mid   # infeasible -- pull back
+    }
+  }
+  lo  # last known feasible value
+}
+
+
+
+
+
+# Diagnostic: report which boundary corners have IS issues.
+# Does NOT modify bounds -- just prints warnings.
+.diagnose_is_bounds <- function(center, lb, ub, brts, model_bin, link_int,
+                                 verbose = TRUE, rho = 1.0) {
+  n_pars <- length(center)
+  any_issues <- FALSE
+
+  for (j in seq_len(n_pars)) {
+    for (side in c("lo", "hi")) {
+      boundary <- if (side == "lo") lb[j] else ub[j]
+      test_pt <- center
+      test_pt[j] <- boundary
+
+      pars8 <- .expand_pars(test_pt, model_bin)
+      is_ok <- tryCatch({
+        raw <- augment_trees(
+          brts = brts, pars = pars8,
+          sample_size = 3L, maxN = 100L,
+          max_missing = 500L, max_lambda = 1e6,
+          num_threads = 1L,
+          model = as.integer(model_bin),
+          link  = as.integer(link_int),
+          rho   = as.numeric(rho),
+          parent_tip_start = .pts(brts),
+          parent_id = .pid(brts)
+        )
+        if (length(raw$trees) == 0L) FALSE
+        else {
+          logf <- eval_logf(pars8, raw$trees,
+                            model = as.integer(model_bin),
+                            link  = as.integer(link_int),
+                            rho   = as.numeric(rho))
+          any(is.finite(logf$logf) & is.finite(logf$logg))
+        }
+      }, error = function(e) FALSE)
+
+      if (!is_ok) {
+        if (verbose) .vcat(sprintf(
+          "    IS warning: %s %s bound (%.4f) - augmentation may struggle here\n",
+          names(center)[j], side, boundary
+        ))
+        any_issues <- TRUE
+      }
+    }
+  }
+
+  if (verbose && !any_issues) .vcat("    all boundary probes OK\n")
+  invisible(any_issues)
+}
+
+
+# Compute typical covariate values at the observed tree.
+# Returns a list of lists, one per active covariate, each with:
+#   intercept_idx, coeff_idx, mu_intercept_idx, mu_coeff_idx, X_obs, name
+.observed_covariates <- function(brts, model_bin) {
+  n_tips <- length(brts) + 1L
+  active <- which(model_bin != 0L)
+  if (length(active) == 0L) return(list())
+
+  # Typical covariate values at the present for the observed tree (orthogonal
+  # basis {N, M = P/N, D = E - M}):
+  #   N: number of tips
+  #   M: mean pendant age (= P/N)
+  #   D: focal deviation from the mean.  Sum_s D = 0, so D has no mean to probe
+  #      along; what the compensatory diagonal needs is the magnitude a single
+  #      lineage's deviation can reach, and the mean pendant age is that scale.
+  mean_pendant <- .mean_pendant_age(brts)
+
+  result <- list()
+  # Parameter layout: [beta_0, (beta_N), (beta_M), (beta_D), gamma_0, ...]
+  # Speciation intercept is always index 1
+  # Extinction intercept is at 1 + length(active) + 1 = length(active) + 2
+  n_lam_pars <- 1L + length(active)
+  mu_int_idx <- n_lam_pars + 1L
+
+  for (k in seq_along(active)) {
+    cov_type <- active[k]  # 1=N, 2=M, 3=D, 4=ED, 5=K
+    coeff_idx    <- 1L + k           # position in lambda block
+    mu_coeff_idx <- mu_int_idx + k   # position in mu block
+
+    X_obs <- switch(cov_type,
+      n_tips,                                  # N
+      mean_pendant,                            # M = P/N (mean pendant age)
+      mean_pendant,                            # D scale ~ pendant-age spread
+      mean_pendant,                            # ED: its pendant edge is most of it
+      2 * log(n_tips)                          # K: the mean depth of a Yule tree with n tips
+    )
+    cov_name <- switch(cov_type, "N", "M", "D", "ED", "K")
+
+    result[[length(result) + 1L]] <- list(
+      intercept_idx    = 1L,
+      coeff_idx        = coeff_idx,
+      mu_intercept_idx = mu_int_idx,
+      mu_coeff_idx     = mu_coeff_idx,
+      X_obs            = X_obs,
+      name             = cov_name
+    )
+  }
+  result
+}
+
+
+# Mean pendant age of the extant lineages at the present.
+#
+# This is M = P/N read at the present, the quantity the C++ covariate basis
+# calls the mean pendant age (model.hpp:142, :153): P = N*t - Sum_s tip_start_s
+# over the lineages alive at t, so M at the present is the mean over the n tips
+# of (T - birth time).  A tip is born when its parent node splits, so its
+# pendant age is the length of its own terminal edge and M is the mean terminal
+# edge length.
+#
+# `brts` alone cannot say which nodes are parents of tips, but the
+# "parent_tip_start" attribute can: it carries the forward time of the parent
+# of every non-crown internal node (.observed_parent_tip_start in inference.R),
+# and the sum over the n tips follows by difference.  Each of the n-1 internal
+# nodes is the parent of exactly 2 children, of which n-2 are themselves
+# internal, so with h = T - brts the forward time of an internal node,
+#
+#   Sum over all children of h(parent)  = 2 * Sum(T - brts)
+#   Sum over internal children          = Sum(parent_tip_start)
+#   Sum over the n tips of birth time   = the difference
+#   M                                   = T - that difference / n
+#
+# Falls back to half the crown age for a bare branching-time vector, which
+# carries no topology; that fallback also catches an attribute of the wrong
+# length rather than returning a number computed from a broken correspondence.
+.mean_pendant_age <- function(brts) {
+  T_max <- max(brts)
+  n_int <- length(brts)          # internal nodes, crown included
+  n_tip <- n_int + 1L
+  pts   <- .pts(brts)
+  pts   <- pts[pts >= 0]         # drop the terminal marker (-1), keep a real 0
+  if (length(pts) != n_int - 1L) return(T_max / 2)
+  sum_birth <- 2 * sum(T_max - brts) - sum(pts)
+  T_max - sum_birth / n_tip
+}
+
+
+# Bisect along an arbitrary direction in parameter space.
+# Starts at center, moves in `sign * direction` until infeasible.
+# Returns the last feasible point, or NULL if center itself fails along this direction.
+# Clamps all probes to the wide bounds box.
+.bisect_direction <- function(center, direction, wide, sign = 1,
+                               model, link, max_t, max_lin,
+                               n_test, steps, tip_lo, tip_hi,
+                               num_threads, rho = 1.0, surv_tries = 20L) {
+  n_pars <- length(center)
+  # Find maximum step size before hitting any wide bound
+  max_step <- Inf
+  for (j in seq_len(n_pars)) {
+    d <- sign * direction[j]
+    if (d > 1e-12) {
+      max_step <- min(max_step, (wide$ub[j] - center[j]) / d)
+    } else if (d < -1e-12) {
+      max_step <- min(max_step, (wide$lb[j] - center[j]) / d)
+    }
+  }
+  if (!is.finite(max_step) || max_step <= 0) return(NULL)
+
+  safe_step <- 0
+  far_step  <- max_step
+
+  for (s in seq_len(steps)) {
+    mid_step <- (safe_step + far_step) / 2
+    cand <- center + sign * mid_step * direction
+    # Clamp to wide bounds (safety)
+    cand <- pmax(cand, wide$lb)
+    cand <- pmin(cand, wide$ub)
+
+    ok <- .test_feasibility(cand, model, link, max_t, max_lin,
+                            n_test = n_test, tip_lo = tip_lo, tip_hi = tip_hi,
+                            num_threads = num_threads, rho = rho, surv_tries = surv_tries)
+    if (ok) {
+      safe_step <- mid_step
+    } else {
+      far_step <- mid_step
+    }
+  }
+
+  if (safe_step > 0) {
+    pt <- center + sign * safe_step * direction
+    pmax(pmin(pt, wide$ub), wide$lb)
+  } else {
+    NULL
+  }
+}
+
+
+# Wide initial bounds, scaled by crown age and tree size.
+#
+# Key constraint: expected tips ~ 2*exp(r*T) where r = lambda - mu.
+# For observed N tips and crown age T: r_hat ~ log(N/2)/T.
+# Upper bound on net rate: r_max such that 2*exp(r_max*T) ~ 50*N.
+# This prevents the probe from wasting time on explosive combos.
+#
+# When covariates are active (DD/D/ND), the intercept can be much higher
+# than the CR feasibility limit because covariate slopes regulate growth.
+# E.g. DD with lambda_0=0.7 and beta_N=-0.03 has K~23, perfectly feasible.
+# We multiply lam_hi by 5x for covariate models to avoid excluding the
+# true parameter region.
+.wide_bounds <- function(model_bin, link_int, max_t, n_tips) {
+  model_bin <- .pad_model_bin(model_bin)
+  active <- which(model_bin != 0L)
+  t_obs <- max(max_t, 0.1)
+  N <- max(n_tips, 2)
+
+  r_hat  <- log(N / 2) / t_obs                # observed net rate
+  r_max  <- log(50 * N / 2) / t_obs           # net rate for 50x tips
+  lam_hi <- max(r_max + 0.5 * r_hat, 0.1) # allow some extinction
+
+  # Turnover headroom.  A reconstructed tree pins the NET rate r = lambda - mu,
+  # not lambda: with extinction lambda = r / (1 - eps), so at eps = 0.9 the
+  # speciation rate is ten times the net rate the tip count implies.  Capping
+  # lambda near r_max treats the two as the same quantity and puts high-turnover
+  # optima outside the box before any likelihood is evaluated -- measured on
+  # cr-n100-e09-l100-t03, whose exact MLE is lambda = 1.121 against a cap of
+  # 0.323.  The cap is only a ceiling for the feasibility search, which still
+  # decides how far the box actually reaches, so the headroom costs nothing
+  # where turnover is low.
+  eps_max <- 0.95
+  lam_hi  <- lam_hi / (1 - eps_max)
+
+  # Covariate models can have much higher intercepts (slopes regulate growth)
+  if (length(active) > 0L) lam_hi <- lam_hi * 5
+
+  lam_lo <- max(0.1 * r_hat, 1e-4)
+  # A slope's cap is set at the scale its covariate takes on the observed
+  # tree, so that the term can move the rate by a fixed amount there: N runs
+  # to the tip count, M, D and ED to the order of the crown age, K to the
+  # depth of a Yule tree with N tips.  Under the exponential link the amount
+  # is 3 on the log-rate (a factor e^3 at the observed scale); under the
+  # others it is 3 |r_hat| on the rate, floored at 0.3.  One width for every
+  # covariate, the old rule, put the N slope at 0.6 per lineage on the
+  # exponential link, e^60 at 100 lineages, and an M-step that stepped there
+  # left the E-step with no augmentation that completes (E23, 2026-10-01).
+  scale  <- c(N = N, M = t_obs / 2, D = t_obs / 2, ED = t_obs / 2, K = 2 * log(N))
+  amount <- if (link_int == 1L) 3 else max(0.3, 3 * abs(r_hat))
+  cov_hi <- amount / pmax(scale[active], 1e-6)
+
+  if (link_int == 1L) {
+    # Exponential link: log-scale
+    lb_lam <- c(log(lam_lo), -cov_hi)
+    ub_lam <- c(log(lam_hi), cov_hi)
+    lb_mu  <- c(log(lam_lo) - 3, -cov_hi)
+    ub_mu  <- c(log(lam_hi), cov_hi)
+  } else {
+    # Linear link: the intercept is a rate, so the box is on the natural
+    # scale and non-negative.
+    lb_lam <- c(.rate_intercept(lam_lo, link_int), -cov_hi)
+    ub_lam <- c(.rate_intercept(lam_hi, link_int), cov_hi)
+    lb_mu  <- c(0.0, -cov_hi)
+    ub_mu  <- c(.rate_intercept(lam_hi * 0.9, link_int), cov_hi)
+  }
+
+  list(lb = c(lb_lam, lb_mu), ub = c(ub_lam, ub_mu))
+}
+
+
+# Latin Hypercube Sample: n points in [lb, ub]
+.lhs_sample <- function(n, lb, ub) {
+  d <- length(lb)
+  mat <- matrix(0, nrow = n, ncol = d)
+  for (j in seq_len(d)) {
+    perm <- sample.int(n)
+    mat[, j] <- lb[j] + (perm - stats::runif(n)) / n * (ub[j] - lb[j])
+  }
+  mat
+}
+
+
+# =========================================================================== #
+#  Use case 2: GAM-based MLE                                                   #
+# =========================================================================== #
+
+#' Estimate log-likelihood at a grid of parameter values via importance sampling
+#'
+#' For each row of \code{pars_mat}, augments \code{sample_size} trees via IS
+#' and computes the IS log-likelihood estimate (fhat).  Returns a data frame
+#' ready for \code{\link{train_likelihood_GAM}}.
+#'
+#' @param tree A \code{phylo} object, branching-time vector, or anything
+#'   accepted by \code{\link{estimate_rates}}.
+#' @param pars_mat Numeric matrix whose rows are compact parameter vectors
+#'   (same layout as \code{pars} in \code{\link{estimate_rates}}).
+#' @param model Model specification: \code{"cr"}, \code{"dd"}, \code{"d"},
+#'   \code{"nd"}, \code{"ed"}, \code{"ned"}, \code{"k"}, \code{"nk"}, or a
+#'   binary integer vector (length 3 to 5).
+#' @param sample_size Number of augmented trees per grid point (default 200).
+#' @param link \code{"exponential"} (default) or \code{"linear"}; see
+#'   \code{\link{estimate_rates}}.
+#' @param max_missing Maximum missing lineages per augmentation (default 1e4).
+#' @param max_lambda Maximum speciation rate (default 500).
+#' @param maxN Total augmentation attempts per grid point.  If \code{NULL},
+#'   set automatically.
+#' @param num_threads Number of threads for the C++ E-step.
+#' @param bias_correct Logical; if \code{TRUE}, use the moment-based
+#'   bias-corrected IS estimator (truncated at order \code{K}).
+#'   Default \code{FALSE} uses the standard log-mean-exp estimator.
+#' @param verbose Print progress (default \code{TRUE}).
+#' @param rho Sampling fraction (0, 1]. Default \code{1} (complete sampling).
+#' @return A data frame with columns for each parameter plus \code{fhat}
+#'   (IS log-likelihood) and \code{n_trees} (number of valid trees obtained).
+#'   Rows where IS failed have \code{fhat = NA}.
+#' @seealso \code{\link{train_likelihood_GAM}}, \code{\link{find_MLE}}
+#' @keywords internal
+estimate_likelihood_surface <- function(tree, pars_mat, model = "cr",
+                                        sample_size = 200L,
+                                        link = "exponential",
+                                        max_missing = 1e4,
+                                        max_lambda = 500,
+                                        maxN = NULL,
+                                        num_threads = 1L,
+                                        bias_correct = FALSE,
+                                        verbose = TRUE,
+                                        max_time = NULL,
+                                        rho = 1.0) {
+  .check_rho(rho, "rho")
+  model_bin <- .resolve_model(model)
+  link_int  <- .resolve_link(link)
+  brts      <- .extract_brts(tree)
+  pts       <- .pts(brts)
+
+  if (!is.matrix(pars_mat)) stop("'pars_mat' must be a matrix.")
+  n_pts <- nrow(pars_mat)
+
+  pars_df <- as.data.frame(pars_mat)
+  if (is.null(colnames(pars_mat)) || any(colnames(pars_mat) == "")) {
+    colnames(pars_df) <- .par_names(model_bin)
+  }
+
+  fhat    <- rep(NA_real_, n_pts)
+  n_trees <- rep(0L, n_pts)
+
+  # Worker function: evaluate IS log-likelihood at one grid point
+  eval_one_point <- function(i) {
+    pars8 <- .expand_pars(pars_mat[i, ], model_bin)
+    maxN_i <- if (is.null(maxN)) max(2000L, 200L * as.integer(sample_size))
+              else as.integer(maxN)
+    raw <- tryCatch(
+      augment_trees(
+        brts = brts, pars = pars8,
+        sample_size = as.integer(sample_size), maxN = maxN_i,
+        max_missing = as.integer(max_missing),
+        max_lambda = as.numeric(max_lambda),
+        num_threads = if (use_r_parallel) 1L else as.integer(num_threads),
+        model = as.integer(model_bin), link = as.integer(link_int),
+        rho = as.numeric(rho), parent_tip_start = pts,
+        parent_id = .pid(brts)
+      ),
+      error = function(e) NULL
+    )
+    if (!is.null(raw)) {
+      logf_i <- eval_logf(pars8, raw$trees,
+                          model = as.integer(model_bin),
+                          link = as.integer(link_int),
+                          rho = as.numeric(rho))
+      list(
+        fhat = .is_fhat(logf_i$logf, logf_i$logg,
+                        bias_correct = bias_correct,
+                        n_zero_weight = .n0(raw$rejected_zero_weights)),
+        n_trees = length(logf_i$logf)
+      )
+    } else {
+      list(fhat = NA_real_, n_trees = 0L)
+    }
+  }
+
+  t0_grid <- proc.time()[3]
+
+  # Adaptive: parallelize at R level when there's enough work per point
+  # (sample_size >= 10 and enough points to fill cores).
+  # Otherwise pass num_threads to C++ TBB for within-point parallelism.
+  use_r_parallel <- (num_threads > 1L &&
+                     .Platform$OS.type == "unix" &&
+                     sample_size >= 10L &&
+                     n_pts >= num_threads)
+
+  if (use_r_parallel) {
+    if (verbose) .vcat(sprintf(
+      "  IS grid: %d points x %d trees (%d cores)...\n",
+      n_pts, sample_size, num_threads
+    ))
+    results_list <- parallel::mclapply(
+      seq_len(n_pts), eval_one_point,
+      mc.cores = num_threads
+    )
+    for (i in seq_len(n_pts)) {
+      res <- results_list[[i]]
+      if (!inherits(res, "try-error") && !is.null(res)) {
+        fhat[i]    <- res$fhat
+        n_trees[i] <- res$n_trees
+      }
+    }
+  } else {
+    # Sequential with progress bar
+    if (verbose) {
+      pb <- progress::progress_bar$new(
+        format = "  IS grid [:bar] :current/:total (:percent) eta: :eta",
+        total = n_pts, clear = FALSE)
+    }
+    for (i in seq_len(n_pts)) {
+      res <- eval_one_point(i)
+      fhat[i]    <- res$fhat
+      n_trees[i] <- res$n_trees
+      if (verbose) pb$tick()
+      .check_time_budget(t0_grid, i, n_pts, max_time,
+                         label = "grid point")
+    }
+  }
+
+  if (verbose) .vcat(sprintf(
+    "  grid done: %.1fs, %d/%d valid\n",
+    proc.time()[3] - t0_grid, sum(is.finite(fhat)), n_pts
+  ))
+
+  cbind(pars_df, fhat = fhat, n_trees = n_trees)
+}
+
+
+#' Fit a GAM to the IS log-likelihood surface
+#'
+#' Takes the output of \code{\link{estimate_likelihood_surface}} and fits a
+#' smooth GAM approximation to the log-likelihood as a function of the model
+#' parameters.
+#'
+#' @param surface Data frame returned by \code{\link{estimate_likelihood_surface}}.
+#'   Rows with \code{fhat = NA} are dropped automatically.
+#' @param par_names Character vector of column names in \code{surface} to use
+#'   as predictors.  If \code{NULL} (default), all columns except \code{fhat}
+#'   and \code{n_trees} are used.
+#' @param spline_type \code{"univariate"} (default) or \code{"bivariate"}.
+#'   See \code{\link{train_GAM}} for details.
+#' @param verbose Report the number of grid points (default \code{TRUE}).
+#' @return A \code{gam} object (Gaussian family) representing
+#'   \eqn{\hat\ell(\theta) \approx \log L(\theta \mid \text{data})}.
+#' @seealso \code{\link{estimate_likelihood_surface}}, \code{\link{find_MLE}}
+#' @keywords internal
+train_likelihood_GAM <- function(surface,
+                                 par_names = NULL,
+                                 spline_type = c("univariate", "bivariate"),
+                                 verbose = TRUE) {
+  spline_type <- match.arg(spline_type)
+  surface <- surface[is.finite(surface$fhat), , drop = FALSE]
+  if (nrow(surface) < 10L)
+    stop("Too few valid likelihood estimates (", nrow(surface),
+         "); need at least 10. Try a larger grid or more IS samples.")
+
+  if (is.null(par_names)) {
+    par_names <- setdiff(colnames(surface), c("fhat", "n_trees"))
+  }
+
+  varying <- par_names[vapply(par_names,
+    function(p) length(unique(surface[[p]])) > 1L, logical(1L))]
+  if (length(varying) == 0L) stop("All parameter columns are constant.")
+
+  # Cap basis dimension at the number of unique values per predictor
+  n_unique <- vapply(varying,
+    function(p) length(unique(surface[[p]])), integer(1L))
+
+  if (spline_type == "univariate" || length(varying) < 2L) {
+    smooth_terms <- vapply(varying, function(p) {
+      k <- min(n_unique[[p]], 10L)
+      if (k < 3L) k <- 3L
+      sprintf("s(%s, k=%d)", p, k)
+    }, character(1L))
+    smooth_terms <- paste(smooth_terms, collapse = " + ")
+  } else {
+    pairs <- utils::combn(varying, 2L, simplify = FALSE)
+    smooth_terms <- paste(
+      vapply(pairs, function(p) {
+        k1 <- min(n_unique[[p[1L]]], 5L)
+        k2 <- min(n_unique[[p[2L]]], 5L)
+        sprintf("te(%s, %s, k=c(%d,%d))", p[1L], p[2L], max(3L, k1), max(3L, k2))
+      }, character(1L)),
+      collapse = " + ")
+  }
+
+  form <- stats::as.formula(paste("fhat ~", smooth_terms))
+  if (verbose)
+    .vcat("Training", spline_type, "likelihood GAM on", nrow(surface),
+          "grid points...\n")
+  mgcv::gam(form, data = surface, family = stats::gaussian())
+}
+
+
+#' Find MLE by optimizing a fitted likelihood GAM
+#'
+#' Uses \code{\link[stats]{optim}} (L-BFGS-B) to maximize the GAM-predicted
+#' log-likelihood surface.
+#'
+#' @param gam_fit A \code{gam} object returned by
+#'   \code{\link{train_likelihood_GAM}}.
+#' @param lower_bound Numeric vector of lower bounds for each parameter.
+#' @param upper_bound Numeric vector of upper bounds for each parameter.
+#' @param start Optional numeric vector of starting values.  If \code{NULL},
+#'   the grid point with the highest predicted value is used.
+#' @param par_names Character vector of parameter names matching the GAM
+#'   predictors.  If \code{NULL}, inferred from the GAM formula.
+#' @return A list with components:
+#'   \describe{
+#'     \item{pars}{Named numeric vector of MLE estimates.}
+#'     \item{loglik}{Predicted log-likelihood at the MLE.}
+#'     \item{convergence}{Convergence code from \code{optim} (0 = success).}
+#'     \item{optim}{Full \code{optim} output.}
+#'   }
+#' @seealso \code{\link{train_likelihood_GAM}},
+#'   \code{\link{estimate_likelihood_surface}}
+#' @keywords internal
+find_MLE <- function(gam_fit, lower_bound, upper_bound,
+                     start = NULL, par_names = NULL) {
+  if (is.null(par_names)) {
+    # Use var.summary (robust for GAMs with s()/te() terms)
+    # all.vars() can pick up spurious names like 'k' from s(x, k=10)
+    par_names <- names(gam_fit$var.summary)
+  }
+  if (length(lower_bound) != length(par_names) ||
+      length(upper_bound) != length(par_names))
+    stop("'lower_bound' and 'upper_bound' must match the number of GAM predictors (",
+         length(par_names), ").")
+
+  neg_loglik <- function(pars) {
+    nd <- as.data.frame(as.list(stats::setNames(pars, par_names)))
+    -stats::predict(gam_fit, newdata = nd, type = "response")
+  }
+
+  if (is.null(start)) {
+    train_data <- gam_fit$model
+    best_idx   <- which.max(stats::fitted(gam_fit))
+    start      <- as.numeric(train_data[best_idx, par_names])
+  }
+
+  opt <- stats::optim(
+    par = start, fn = neg_loglik,
+    method = "L-BFGS-B",
+    lower = lower_bound, upper = upper_bound
+  )
+
+  list(
+    pars        = stats::setNames(opt$par, par_names),
+    loglik      = -opt$value,
+    convergence = opt$convergence,
+    optim       = opt
+  )
+}
+
+
+# .par_names() is defined in inference.R -- shared by both modules

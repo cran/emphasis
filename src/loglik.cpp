@@ -1,0 +1,245 @@
+
+#include <Rcpp.h>
+#include "emphasis.hpp"
+#include "model.hpp"
+#include "rinit.h"
+using namespace Rcpp;
+
+namespace loglik {
+
+emphasis::tree_t pack(const Rcpp::DataFrame& r_tree) {
+  emphasis::tree_t new_tree;
+  Rcpp::NumericVector brts      = r_tree["brts"];
+  Rcpp::NumericVector n         = r_tree["n"];
+  Rcpp::NumericVector t_ext     = r_tree["t_ext"];
+  Rcpp::NumericVector pd        = r_tree["pd"];
+  Rcpp::NumericVector tip_start_v, focal_tip_start_v;
+  Rcpp::IntegerVector clade_v, id_v, parent_id_v;
+  bool has_tip_start = r_tree.containsElementNamed("tip_start");
+  bool has_focal_ts  = r_tree.containsElementNamed("focal_tip_start");
+  bool has_clade     = r_tree.containsElementNamed("clade");
+  bool has_id        = r_tree.containsElementNamed("id");
+  bool has_parent_id = r_tree.containsElementNamed("parent_id");
+  if (has_tip_start) tip_start_v = r_tree["tip_start"];
+  if (has_focal_ts)  focal_tip_start_v = r_tree["focal_tip_start"];
+  if (has_clade)     clade_v = r_tree["clade"];
+  if (has_id)        id_v = r_tree["id"];
+  if (has_parent_id) parent_id_v = r_tree["parent_id"];
+
+  for (int i = 0; i < r_tree.nrow(); ++i) {
+    emphasis::node_t entry;
+    entry.brts      = brts[i];
+    entry.n         = n[i];
+    entry.t_ext     = t_ext[i];
+    entry.pd        = pd[i];
+    entry.tip_start = has_tip_start ? tip_start_v[i] : 0.0;
+    entry.id        = has_id ? id_v[i] : -1;
+    entry.parent_id = has_parent_id ? parent_id_v[i] : -1;
+    // A tree built without the column carries no splitting lineage, so the
+    // event is mean-field (D = 0) exactly where it was before: at a node whose
+    // parent is not on record.
+    entry.focal_tip_start = has_focal_ts ? focal_tip_start_v[i]
+                          : (emphasis::has_parent(entry.parent_id) ? 0.0
+                                                                  : emphasis::ts_unknown);
+    // Absent, the tree is read under the legacy convention, which is what a
+    // data frame built without the column has always meant.
+    entry.clade     = has_clade ? clade_v[i] : 0;
+    new_tree.push_back(entry);
+  }
+  return new_tree;
+}
+
+}  // namespace loglik
+
+
+//' Evaluate log p(obs, z | theta) and log q(z | obs, theta) for augmented trees
+//'
+//' Given a list of augmented trees (produced by \code{\link{augment_trees}})
+//' and a parameter vector, computes for each tree:
+//' \itemize{
+//'   \item \code{logf[i] = log p(obs, z_i | theta)} (model log-likelihood)
+//'   \item \code{logg[i] = log q(z_i | obs, theta)} (proposal log-probability)
+//' }
+//' Both are evaluated at the supplied \code{pars}, regardless of which
+//' parameters were used to simulate the trees.  This is essential for
+//' shared-tree (Mode 2) evaluation where trees simulated at one particle
+//' are scored at another.
+//'
+//' @param pars Numeric vector of 8 model parameters.
+//' @param trees List of augmented-tree data frames (output of
+//'   \code{\link{augment_trees}}).
+//' @param model Integer vector \code{c(use_N, use_P, use_E)}.
+//' @param link Link function: \code{0} = linear, \code{1} = exponential.
+//' @return A named list:
+//' \describe{
+//'   \item{logf}{Numeric vector of \code{log p(obs, z_i | theta)}.}
+//'   \item{logg}{Numeric vector of \code{log q(z_i | obs, theta)}.}
+//' }
+//' @keywords internal
+// [[Rcpp::export(name = "eval_logf")]]
+Rcpp::List eval_logf_cpp(const std::vector<double>& pars,
+                         const Rcpp::List& trees,
+                         Rcpp::IntegerVector model = Rcpp::IntegerVector::create(0, 0, 0),
+                         int link = 0,
+                         double rho = 1.0) {
+  std::vector<int> model_bin(model.begin(), model.end());   // 3 or 4 flags; Model pads
+  emphasis::param_t lb8(8, -1e6), ub8(8, 1e6);
+  auto mdl = emphasis::Model(lb8, ub8, model_bin, link, rho);
+
+  std::vector<double> logf(trees.size());
+  std::vector<double> logg(trees.size());
+  for (int i = 0; i < trees.size(); ++i) {
+    auto local_tree = loglik::pack(Rcpp::as<Rcpp::DataFrame>(trees[i]));
+    logf[i] = mdl.loglik(pars, local_tree);
+    logg[i] = mdl.sampling_prob(pars, local_tree);
+  }
+
+  return Rcpp::List::create(
+    Rcpp::Named("logf") = logf,
+    Rcpp::Named("logg") = logg
+  );
+}
+
+
+//' Log-likelihood of complete trees with latent marks summed out
+//'
+//' Development entry point of the latent-mark likelihood
+//' (dev/latent-marks/design.md): \code{eval_logf} with every lineage carrying
+//' an unseen mark that multiplies its rates.  Exponential link only.
+//' @param S Number of marks.
+//' @param log_clam,log_cmu Log rate multipliers per mark (length S).
+//' @param C Joint kernel of the daughters' marks, \code{C[(m*S + a)*S + b]}
+//'   (length S^3); not read when \code{P} is given.
+//' @param P Kernel of one daughter's mark, row-major S x S, daughters
+//'   independent; empty to use \code{C}.
+//' @param pi Law of the root mark (length S).
+//' @keywords internal
+// [[Rcpp::export(name = "eval_logf_marks")]]
+std::vector<double> eval_logf_marks_cpp(const std::vector<double>& pars,
+                                        const Rcpp::List& trees,
+                                        Rcpp::IntegerVector model,
+                                        int link,
+                                        double rho,
+                                        int S,
+                                        const std::vector<double>& log_clam,
+                                        const std::vector<double>& log_cmu,
+                                        const std::vector<double>& C,
+                                        const std::vector<double>& P,
+                                        const std::vector<double>& pi) {
+  std::vector<int> model_bin(model.begin(), model.end());
+  emphasis::param_t lb8(8, -1e6), ub8(8, 1e6);
+  auto mdl = emphasis::Model(lb8, ub8, model_bin, link, rho);
+  emphasis::marks_t mk;
+  mk.S = S; mk.log_clam = log_clam; mk.log_cmu = log_cmu; mk.C = C; mk.P = P; mk.pi = pi;
+  std::vector<double> logf(trees.size());
+  for (int i = 0; i < trees.size(); ++i) {
+    auto local_tree = loglik::pack(Rcpp::as<Rcpp::DataFrame>(trees[i]));
+    logf[i] = mdl.loglik_marks(pars, local_tree, mk);
+  }
+  return logf;
+}
+
+
+//' Posterior of the latent marks on a complete tree
+//'
+//' Development entry point (dev/latent-marks/design.md): for every stretch of
+//' every lineage (from its birth or a split to its next split or its end),
+//' the posterior probabilities of its mark given the tree.
+//' @inheritParams eval_logf_marks_cpp
+//' @param tree One complete-tree data frame with the topology.
+//' @return A list: \code{rows} (data frame of lineage, stretch, id, t_from,
+//'   t_to), \code{post} (matrix, one row per stretch, S columns) and
+//'   \code{loglik}.
+//' @keywords internal
+// [[Rcpp::export(name = "marks_posterior")]]
+Rcpp::List marks_posterior_cpp(const std::vector<double>& pars,
+                               const Rcpp::DataFrame& tree,
+                               Rcpp::IntegerVector model,
+                               int link,
+                               double rho,
+                               int S,
+                               const std::vector<double>& log_clam,
+                               const std::vector<double>& log_cmu,
+                               const std::vector<double>& C,
+                               const std::vector<double>& P,
+                               const std::vector<double>& pi) {
+  std::vector<int> model_bin(model.begin(), model.end());
+  emphasis::param_t lb8(8, -1e6), ub8(8, 1e6);
+  auto mdl = emphasis::Model(lb8, ub8, model_bin, link, rho);
+  emphasis::marks_t mk;
+  mk.S = S; mk.log_clam = log_clam; mk.log_cmu = log_cmu; mk.C = C; mk.P = P; mk.pi = pi;
+  auto local_tree = loglik::pack(tree);
+  auto r = mdl.marks_posterior(pars, local_tree, mk);
+  const int n = static_cast<int>(r.lineage.size());
+  Rcpp::NumericMatrix post(n, S);
+  for (int i = 0; i < n; ++i)
+    for (int m = 0; m < S; ++m) post(i, m) = r.post[static_cast<std::size_t>(i)][static_cast<std::size_t>(m)];
+  return Rcpp::List::create(
+    Rcpp::Named("rows") = Rcpp::DataFrame::create(
+      Rcpp::Named("lineage") = r.lineage, Rcpp::Named("stretch") = r.stretch, Rcpp::Named("id") = r.id,
+      Rcpp::Named("t_from") = r.t_from, Rcpp::Named("t_to") = r.t_to),
+    Rcpp::Named("post") = post,
+    Rcpp::Named("loglik") = r.loglik);
+}
+
+
+//' The per-lineage design an augmented tree's likelihood is built on
+//'
+//' One row per lineage alive on each segment between consecutive events:
+//' the segment, the lineage (index and id), whether that lineage's event ends
+//' the segment (0 none, 1 speciation, 2 extinction), the segment's bounds,
+//' N, M, the lineage's pendant start (so D = (t - ts) - M) and its ED at the
+//' segment start (ED grows at slope one within the segment).
+//' @param tree One augmented-tree data frame with the topology (ids).
+//' @keywords internal
+// [[Rcpp::export(name = "lineage_table_cpp")]]
+Rcpp::DataFrame lineage_table_cpp(const Rcpp::DataFrame& tree) {
+  emphasis::param_t lb8(8, -1e6), ub8(8, 1e6);
+  std::vector<int> mb{1, 0, 1, 1, 1};
+  auto mdl = emphasis::Model(lb8, ub8, mb, 0, 1.0);
+  auto local_tree = loglik::pack(tree);
+  auto r = mdl.lineage_table(local_tree);
+  return Rcpp::DataFrame::create(
+    Rcpp::Named("seg") = r.seg, Rcpp::Named("lineage") = r.lin, Rcpp::Named("id") = r.id,
+    Rcpp::Named("event") = r.ev, Rcpp::Named("t0") = r.t0, Rcpp::Named("t1") = r.t1,
+    Rcpp::Named("N") = r.N, Rcpp::Named("M") = r.M, Rcpp::Named("ts") = r.ts,
+    Rcpp::Named("ed0") = r.ed0, Rcpp::Named("K") = r.K);
+}
+
+//' The pendant PD and thinning rate the sampler sees at arbitrary times
+//'
+//' \code{Model::pendant_pd_at} reads P off the node that governs the segment a
+//' candidate time falls in; \code{Model::nh_rate} is the intensity of the
+//' sampler's birth process there.  This exposes both, so a test can hold P
+//' against an independent recomputation from the augmented tree and against
+//' \code{pd + n * (t - brts)} of the governing node, and can scan the intensity
+//' over a segment to check that its value at the segment start dominates it.
+//'
+//' @param pars Numeric vector of 8 model parameters.
+//' @param tree One augmented-tree data frame.
+//' @param times Numeric vector of times at which to evaluate.
+//' @param model Integer vector \code{c(use_N, use_M, use_D)}.
+//' @param link Link function: 0 = linear, 1 = exponential.
+//' @param rho Sampling fraction.
+//' @return A named list with \code{pd} (the pendant PD used) and \code{nh}
+//'   (the non-homogeneous thinning rate) at each time.
+//' @keywords internal
+// [[Rcpp::export(name = "eval_nh_rate")]]
+Rcpp::List eval_nh_rate_cpp(const std::vector<double>& pars,
+                            const Rcpp::DataFrame& tree,
+                            const std::vector<double>& times,
+                            Rcpp::IntegerVector model = Rcpp::IntegerVector::create(0, 0, 0),
+                            int link = 0,
+                            double rho = 1.0) {
+  std::vector<int> model_bin(model.begin(), model.end());   // 3 or 4 flags; Model pads
+  emphasis::param_t lb8(8, -1e6), ub8(8, 1e6);
+  auto mdl = emphasis::Model(lb8, ub8, model_bin, link, rho);
+  auto local_tree = loglik::pack(tree);
+
+  std::vector<double> pd(times.size()), nh(times.size());
+  for (size_t i = 0; i < times.size(); ++i) {
+    pd[i] = mdl.pendant_pd_at(times[i], local_tree);
+    nh[i] = mdl.nh_rate(times[i], pars, local_tree);
+  }
+  return Rcpp::List::create(Rcpp::Named("pd") = pd, Rcpp::Named("nh") = nh);
+}
